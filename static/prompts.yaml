@@ -1,0 +1,15 @@
+- label: upcoming events
+  icon: calendar
+  prompt: List events occurring on or after {{today}}
+
+- label: weather forecast
+  icon: sun
+  prompt: Get the weather forecast for the Sun City Hilton Head area
+
+- label: today is
+  icon: sun
+  prompt: What is the today's date?
+
+- label: requesting modifications
+  icon: sun
+  prompt: How are modifications requested?

@@ -1,0 +1,20 @@
+{
+    "name": "SCHH AI Chatbot",
+    "short_name": "SCHH AI",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#ffffff",
+    "theme_color": "#791917",
+    "icons": [
+        {
+            "src": "images/logo-192x192.png",
+            "type": "image/png",
+            "sizes": "192x192"
+        },
+        {
+            "src": "images/logo-512x512.png",
+            "type": "image/png",
+            "sizes": "512x512"
+        }
+    ]
+}
