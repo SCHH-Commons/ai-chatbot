@@ -186,6 +186,7 @@
 
       const model = modelEl.value.trim() || 'gpt-5-mini';
       const index = indexEl.value.trim() || 'schh';
+      const namespace = 'schh';
       const endpoint = endpointEl.value.trim() || '/chat';
       const stream = !!streamToggle.checked;
 
@@ -198,7 +199,7 @@
       sendBtn.disabled = true; stopBtn.disabled = false;
       controller = new AbortController();
 
-      const payload = { prompt: text, model, index, stream, sessionid: sid };
+      const payload = { prompt: text, model, index, namespace, stream, sessionid: sid };
       const t0 = performance.now();
 
       try{
