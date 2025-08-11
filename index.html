@@ -1,422 +1,289 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="#791917">
-  <meta name="apple-mobile-web-app-title" content="SCHH AI Chatbot">
-  <link rel="icon" type="image/x-icon" href="static/images/favicon.ico">
-  <link rel="manifest" href="static/manifest.json">
-  <title>AI Chatbot</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/themes/light.css" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Community AI Chat</title>
   <style>
-    *, *::before, *::after { box-sizing: border-box; }
-    @keyframes fadeInOpacity { 0% { opacity: 0; } 100% { opacity: 1; } }
-    html { background-color: #f8f9fa; }
-    body { max-width: 800px; margin: auto; padding: 0; height: 100dvh; display: flex; flex-direction: column; background-color: #fff; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); font-size: 1.1em; }
-    header, footer { text-align: center; flex-shrink: 0; display: flex; align-items: center; gap: 0.5em; padding: 0 .5em; }
-    main { flex-grow: 1; overflow-y: auto; position: relative; }
-    header, footer, main { width: 100%;  max-width: 800px; }
-
-    body, sl-drawer::part(title) { font-family: ui-sans-serif, -apple-system, system-ui, Segoe UI, Helvetica, Apple Color Emoji, Arial, sans-serif, Segoe UI Emoji, Segoe UI Symbol; }
-    
-    .chat-container { position: relative; width: 100%; height: 40%; display: flex; flex-direction: column; overflow: hidden; margin: 0 auto; }
-    .chat-area { flex: 1; padding: 1.5em .5em .5em .5em; overflow-y: scroll; display: flex; flex-direction: column; gap: 12px; }
-    .message { padding: 10px 14px; border-radius: 8px; line-height: 1.5; }
-    .user-message { align-self: flex-end; background-color: #ededed; color: #444; }
-    .bot-message { align-self: flex-start; background-color: #fff; color: #444;}
-    .prompts { display: flex; gap: 0.5em; justify-content: center; padding: 0.5em; width: 100%; margin: auto; }
-    .chat-textarea { flex: 1; min-height: 40px; max-height: 150px; overflow-y: auto; }
-    .advisory { flex: 1; padding: 0.5em .5em 1em .5em; font-size: 0.8em; text-align: center; }
-
-    .input-container { display: flex; align-items: center; padding: 1em 1em .5em 1em; gap: 8px; width: 100%; align-self: center; border: 1px solid #ededed; border-radius: 1em; padding: 2em 1em; background-color: #ededed; }
-    .input-container svg, footer svg { width: 32px; height: 32px; opacity: 1; cursor: pointer; }
-    .input-container svg { opacity: 0.8; }
-    .input-container svg:hover { opacity: 1; }x
-    svg.submit { fill: #444; background-color: #fff; border-radius: 50%;}
-    svg.refresh { fill: #444; width: 24px; height: 24px; cursor: pointer; }
-
-    .drawer-toggle { fill: #444; width: 24px; height: 24px; cursor: pointer; }
-    /* sl-copy-button { position: absolute; right: -22px; bottom: -4px; margin-left: 0.25rem; padding: 0; background-color: inherit; } */
-    /* sl-drawer::part(base) { height: calc(100% - 98px); } */
-    sl-drawer::part(header) { text-align: center; }
-    sl-drawer::part(title) { font-size: 1.5em; font-weight: bold; }
-    sl-drawer::part(body) { padding: 1em .5em; }
-    .drawer-content p { font-size: 1.1em; line-height: 1.5; }
-    sl-tab-panel { font-size: 90%; line-height: 1.3; color: #444; }
-    sl-tab-panel > h1 { font-size: 1.5em; }
-    sl-tab-panel > :is(h1, h2, h3, h4, h5, h6) { margin: .5em 0; }
-    sl-tab-panel > :is(h1, h2, h3, h4, h5, h6):first-child, sl-tab-panel > :is(h1, h2, h3, h4, h5, h6):nth-child(2) { margin-top: 0; }
-    sl-tab-panel[name="settings"] > div { border: 1px solid #e9ecef; padding: 1em; border-radius: 8px; }
-    sl-tab-panel::part(base) { padding-top: 0; }
-    sl-tab::part(base) { padding: 0 1em 1em 0; }
-    sl-tab svg { width: 24px; height: 24px; }
-    sl-tab[active] svg { fill: var(--sl-color-primary-600); }
-    @media (min-width: 600px) { /* desktop, laptops, wider devices */
-      .chat-area { padding: 2em 1em 1em 1em; } 
-      .message { max-width: 90%; box-shadow: rgba(0, 0, 0, 0.16) 0px 1px 4px; }
-      .bot-message { border: 1px solid #e9ecef; }
-      .input-container, .prompts { width: 80%; }
-    }
-    /* sl-button::part(base) { background-color: #791917; border-color: #791917; } */
-    #settings { display: flex; flex-direction: column; gap: 0.5em; height: 100%;}
-    .selector { display: flex; gap: 1em; align-items: center; }
-    .prompts { display: flex; gap: 0.5em; flex-wrap: wrap; justify-content: center; }
-    .prompts svg { width: 16px; height: 16px; }
-    .prompts sl-button::part(base) { font-family: "Arial Narrow", "Helvetica Condensed", "Roboto Condensed", sans-serif; }
-    header h1 { font-size: 1.5em; color: #444; flex: 1; text-align: center; margin: .5em; }
-
-    .tools { display: flex; gap: 0.5em; opacity: 0; transition: opacity 0.5s; }
-    .tools > * { color: #888 }
-    .response:d .tools { opacity: 1; }
-    .content { background-color: white; max-width: 80dvw; max-height: 50dvh; overflow: auto; padding: 1em; border: 1px solid #e9ecef; border-radius: 8px; }
-
-    .sources svg { width: 20px; height: 20px; fill: rgb(136, 136, 136); margin-top: 6px; cursor: pointer; }
-    pre { white-space: pre-wrap; word-wrap: break-word; }
+    :root { --bg:#0f172a; --fg:#e2e8f0; --card:#0b1220; --muted:#94a3b8; --accent:#38bdf8; --border:#1f2937; }
+    html,body{height:100%}
+    body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    .wrap{max-width:960px;margin:0 auto;display:flex;flex-direction:column;height:100%}
+    header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center}
+    header h1{font-size:16px;font-weight:600;margin:0}
+    .pill{font-size:12px;color:var(--muted);padding:2px 8px;border:1px solid #334155;border-radius:999px}
+    main{flex:1;display:flex;min-height:0}
+    .panel{flex:1;display:flex;flex-direction:column}
+    .log{flex:1;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:14px}
+    .msg{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;max-width:78%}
+    .ai{align-self:flex-start}
+    .user{align-self:flex-end;background:#0a1424}
+    .meta{color:var(--muted);font-size:12px;margin-top:8px}
+    .sources{margin-top:12px;border-top:1px dashed var(--border);padding-top:10px}
+    .sources a{color:var(--accent);text-decoration:none}
+    .composer{display:flex;gap:10px;padding:12px;border-top:1px solid var(--border);background:#0b1220}
+    textarea{flex:1;resize:vertical;min-height:64px;max-height:220px;padding:10px;border-radius:10px;border:1px solid #334155;background:#0a1424;color:var(--fg)}
+    button{background:#0ea5e9;border:none;color:white;padding:10px 14px;border-radius:10px;cursor:pointer}
+    button[disabled]{opacity:.6;cursor:not-allowed}
+    .settings{display:flex;gap:10px;align-items:center;flex-wrap:wrap;color:var(--muted);padding:8px 12px;border-top:1px solid var(--border);background:#0b1220}
+    .settings input{background:#0a1424;color:var(--fg);border:1px solid #334155;border-radius:8px;padding:6px 8px}
+    .row{display:flex;gap:8px;align-items:center}
+    /* Markdown tweaks */
+    .content :is(h1,h2,h3){margin:12px 0 8px 0}
+    .content p{margin:8px 0}
+    .content ul{padding-left:22px}
+    .content code{background:#0f1a2d;padding:2px 6px;border-radius:6px}
+    .content pre{background:#0f1a2d;padding:10px;border-radius:10px;overflow:auto}
+    .content a{color:var(--accent)}
   </style>
+  <!-- Markdown renderer + sanitizer -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 </head>
 <body>
-
-  <header>
-    <!-- menu icon -->
-    <svg class="drawer-toggle" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><path d="M0 96C0 78.3 14.3 64 32 64l384 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 128C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32l384 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 288c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32L32 448c-17.7 0-32-14.3-32-32s14.3-32 32-32l384 0c17.7 0 32 14.3 32 32z"/></svg>
-    <h1>SCHH AI Chatbot</h1>
-  </header>
-  <main>
-    <div class="chat-container">
-      <div class="chat-area" id="chat-area"></div>
-      <div class="input-container">
-        <!-- refresh icon -->
-        <svg class="refresh" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="#FFF"><path d="M142.9 142.9c-17.5 17.5-30.1 38-37.8 59.8c-5.9 16.7-24.2 25.4-40.8 19.5s-25.4-24.2-19.5-40.8C55.6 150.7 73.2 122 97.6 97.6c87.2-87.2 228.3-87.5 315.8-1L455 55c6.9-6.9 17.2-8.9 26.2-5.2s14.8 12.5 14.8 22.2l0 128c0 13.3-10.7 24-24 24l-8.4 0c0 0 0 0 0 0L344 224c-9.7 0-18.5-5.8-22.2-14.8s-1.7-19.3 5.2-26.2l41.1-41.1c-62.6-61.5-163.1-61.2-225.3 1zM16 312c0-13.3 10.7-24 24-24l7.6 0 .7 0L168 288c9.7 0 18.5 5.8 22.2 14.8s1.7 19.3-5.2 26.2l-41.1 41.1c62.6 61.5 163.1 61.2 225.3-1c17.5-17.5 30.1-38 37.8-59.8c5.9-16.7 24.2-25.4 40.8-19.5s25.4 24.2 19.5 40.8c-10.8 30.6-28.4 59.3-52.9 83.8c-87.2 87.2-228.3 87.5-315.8 1L57 457c-6.9 6.9-17.2 8.9-26.2 5.2S16 449.7 16 440l0-119.6 0-.7 0-7.6z"/></svg>
-        <sl-textarea
-          class="chat-textarea"
-          placeholder="Type your message..."
-          rows="1"
-          resize="auto">
-        </sl-textarea>
-        <svg class="submit" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM385 215c9.4 9.4 9.4 24.6 0 33.9s-24.6 9.4-33.9 0l-71-71L280 392c0 13.3-10.7 24-24 24s-24-10.7-24-24l0-214.1-71 71c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9L239 103c9.4-9.4 24.6-9.4 33.9 0L385 215z"/></svg>
+  <div class="wrap">
+    <header>
+      <h1>Community AI Chat</h1>
+      <span class="pill">RAG</span>
+      <div style="margin-left:auto" class="row">
+        <label class="row" style="gap:6px">
+          <input type="checkbox" id="streamToggle" checked>
+          <span>Stream</span>
+        </label>
       </div>
-    </div>
-    <div class="prompts"></div>
+    </header>
 
-    <sl-drawer contained no-header class="drawer" style="--size: 100%;">
-      <sl-tab-group placement="start">
-        <sl-tab slot="nav" panel="about">
-          <!-- info icon -->
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 512">
-            <path d="M48 80a48 48 0 1 1 96 0A48 48 0 1 1 48 80zM0 224c0-17.7 14.3-32 32-32l64 0c17.7 0 32 14.3 32 32l0 224 32 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 512c-17.7 0-32-14.3-32-32s14.3-32 32-32l32 0 0-192-32 0c-17.7 0-32-14.3-32-32z"/>
-          </svg>
-        </sl-tab>
-          <sl-tab slot="nav" panel="settings">
-          <!-- settings (gear) icon -->
-          <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" x="0px" y="0px" viewBox="0 0 100 100" enable-background="new 0 0 100 100" xml:space="preserve">
-            <path d="M82.6,39.8c-0.5-1.8-1.3-3.7-2.3-5.7c1.9-2.6,4.1-5.2,6-8.1c0.6-0.8,0.6-1.7,0-2.6c-2.4-3.5-6.4-7.1-9.7-9.9  c-0.8-0.8-1.9-0.8-2.8-0.1l-8.4,6.2c-1.6-0.8-3.5-1.5-5.2-2.2L58.6,6.8C58.5,5.7,57.7,5,56.5,5h-13c-1.2,0-2,0.7-2.2,1.7  c-0.8,3.4-1.2,7.3-1.6,10.7c-1.8,0.6-3.6,1.3-5.2,2.3l-8.1-6.2c-0.5-0.4-1.2-0.7-1.6-0.7c-2,0-9.8,8.7-11.3,10.6  c-0.8,1-0.7,1.6,0.1,2.7c2.1,2.8,4.2,5.4,6.2,8.1c-0.9,1.9-1.6,3.4-2.2,5.4L6.6,41.2C5.7,41.4,5,42.5,5,43.5v12.9  c0,1,0.7,1.9,1.7,2.1l10.6,1.7c0.5,1.8,1.4,3.7,2.3,5.6c-1.9,2.7-4,5.2-6,8.1c-0.6,0.9-0.5,1.8,0,2.6c2.5,3.5,6.4,7.1,9.7,10  c0.9,0.8,1.9,0.8,2.8,0.2l8.4-6.2c1.7,0.8,3.5,1.5,5.2,2.1l1.6,10.7c0.1,0.9,1,1.8,2.2,1.8h13c1.2,0,1.8-0.7,2.1-1.7  c0.9-3.4,1.3-7.3,1.7-10.7c1.8-0.6,3.6-1.4,5.3-2.2l8.1,6.3c0.5,0.4,1.1,0.5,1.6,0.5c1.9,0,9.8-8.8,11.3-10.7  c0.6-0.8,0.5-1.6-0.2-2.6c-2.1-2.9-4.2-5.5-6.2-8.4c0.9-1.6,1.6-3.2,2.3-5.2l10.7-1.6c1-0.1,1.7-1.2,1.7-2V43.6  c0-0.9-0.7-1.9-1.7-2.2L82.6,39.8z M49.9,65C41.7,65,35,58.3,35,50.1C35,41.7,41.7,35,49.9,35c8.3,0,15,6.7,15,15.1  C64.9,58.3,58.2,65,49.9,65z"></path>
-          </svg>
-        </sl-tab>
-      
-        <sl-tab-panel name="about"></sl-tab-panel>
-        <sl-tab-panel name="settings">
-          <h1>Settings</h1>
-          <div id="settings"></div>
-        </sl-tab-panel>
-      </sl-tab-group>
-      <sl-button slot="footer" variant="primary">Close</sl-button>
-    </sl-drawer>
-    
-  </main>
-  <footer>
-    <div class="advisory">This tool can make mistakes. Check important info.</div>
-  </footer>
+    <main>
+      <div class="panel">
+        <div id="log" class="log"></div>
 
-  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
-  <script type="module">
+        <div class="settings">
+          <div class="row">
+            <label for="model">Model</label>
+            <input id="model" value="gpt-5-mini" size="14" />
+          </div>
+          <div class="row">
+            <label for="index">Index</label>
+            <input id="index" value="schh" size="10" />
+          </div>
+          <div class="row">
+            <label for="endpoint">Endpoint</label>
+            <input id="endpoint" value="/chat" size="18" />
+          </div>
+          <div class="row">
+            <label for="sid">Session</label>
+            <input id="sid" value="" placeholder="auto (persisted)" size="22" />
+          </div>
+        </div>
 
-    import { marked } from "https://cdn.jsdelivr.net/npm/marked/lib/marked.esm.js";
+        <div class="composer">
+          <textarea id="prompt" placeholder="Ask a question…"></textarea>
+          <button id="send">Send</button>
+          <button id="stop" disabled>Stop</button>
+        </div>
+      </div>
+    </main>
+  </div>
 
-    // import any needed Shoelace components (https://shoelace.style/)
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/button/button.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/copy-button/copy-button.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/drawer/drawer.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/dropdown/dropdown.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/option/option.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/select/select.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/spinner/spinner.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/switch/switch.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/tab/tab.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/tab-group/tab-group.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/tab-panel/tab-panel.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/textarea/textarea.js';
-    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/tooltip/tooltip.js';
+  <script>
+    const $ = sel => document.querySelector(sel);
+    const log = $('#log');
+    const promptEl = $('#prompt');
+    const sendBtn = $('#send');
+    const stopBtn = $('#stop');
 
-    const inIframe = window.location !== window.parent.location // flag indicating if the page is in an iframe
-    const isMobile = ('ontouchstart' in document.documentElement && /mobi/i.test(navigator.userAgent) )
+    const modelEl = $('#model');
+    const indexEl = $('#index');
+    const endpointEl = $('#endpoint');
+    const sidEl = $('#sid');
+    const streamToggle = $('#streamToggle');
 
-    const apiEndpoint = location.hostname === 'localhost' ? '' : 'https://ai-chatbot-fkiv.onrender.com'
-
-    let sessionid = Math.random().toString(36).substring(7)
-    let msgCtr = 0
-
-    const containerEl = document.querySelector('.chat-container')
-    const chatEl = document.querySelector('.chat-area')
-    const drawerEl = document.querySelector('.drawer')
-    const drawerContentEl = document.querySelector('sl-tab-panel[name="about"]')
-    const inputContainerEl = document.querySelector('.input-container')
-    const inputEl = document.querySelector('.chat-textarea')
-    const promptsEl = document.querySelector('.prompts')
-    const submitEl = document.querySelector('.submit')
-    const drawerToggleEl = document.querySelector('.drawer-toggle')
-    const refreshButton = document.querySelector('.refresh')
-    if (!isMobile) setTimeout(() => inputEl.focus(), 100)
-    submitEl.addEventListener('click', (e) => { 
-      let message = inputEl.value.trim()
-      inputEl.value = ''
-      if (message !== '') sendMessage(message)
-      if (!isMobile) inputEl.focus()
-    })
-    inputEl.addEventListener('keydown', (e) => { 
-      if (e.key === 'Enter') {
-        e.preventDefault()
-        e.stopPropagation()
-        submitEl.dispatchEvent(new CustomEvent('click'))
+    // ---- Session id helpers ----
+    function randHex(len = 16) {
+      if (crypto?.getRandomValues) {
+        const buf = new Uint8Array(len/2);
+        crypto.getRandomValues(buf);
+        return [...buf].map(b => b.toString(16).padStart(2,'0')).join('');
       }
-    })
-    drawerEl.querySelector('sl-button')?.addEventListener('click', () => drawerEl.open = false)
-    drawerToggleEl.addEventListener('click', () => drawerEl.open = !drawerEl.open)
+      return Math.random().toString(16).slice(2).padEnd(len, '0').slice(0, len);
+    }
 
-    const getDrawerContent = (path) => {
-      if (!path.endsWith('.md')) path += '.md'
-      fetch(`static/${path}`).then(response => response.text()).then(text => {
-        drawerContentEl.innerHTML = `<a href="about" style="color: #791917; display:${path === 'about.md' ? 'none' : 'block'};">Back</a> ` + marked.parse(text) 
-        drawerContentEl.querySelectorAll('a').forEach(a => {
-          if (new URL(a.href).origin === window.location.origin) {
-            a.addEventListener('click', (e) => {
-              e.preventDefault()
-              getDrawerContent(a.getAttribute('href'))
-            })
+    function getOrCreateSessionId() {
+      let sid = localStorage.getItem('sessionid');
+      if (!sid) {
+        sid = randHex(16);
+        localStorage.setItem('sessionid', sid);
+      }
+      return sid;
+    }
+
+    // Persisted UI settings
+    const store = {
+      get k(){ return 'community-chat-settings' },
+      load(){ try{
+        const v = JSON.parse(localStorage.getItem(this.k)||'{}');
+        if (v.model) modelEl.value = v.model;
+        if (v.index) indexEl.value = v.index;
+        if (v.endpoint) endpointEl.value = v.endpoint;
+        if (typeof v.stream === 'boolean') streamToggle.checked = v.stream;
+      }catch{} },
+      save(){
+        const v = {
+          model:modelEl.value.trim(),
+          index:indexEl.value.trim(),
+          endpoint:endpointEl.value.trim(),
+          stream:streamToggle.checked
+        };
+        localStorage.setItem(this.k, JSON.stringify(v));
+      }
+    };
+    store.load();
+
+    // Initialize and display current session id
+    sidEl.value = getOrCreateSessionId();
+
+    function addMessage(role, html='') {
+      const div = document.createElement('div');
+      div.className = `msg ${role}`;
+      div.innerHTML = `<div class="content">${html}</div>`;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+      return div;
+    }
+
+    function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    function renderMD(markdown){
+      try { return DOMPurify.sanitize(marked.parse(markdown || '')); }
+      catch { return escapeHtml(markdown || ''); }
+    }
+
+    function addSources(container, sources){
+      if (!sources || !sources.length) return;
+      const s = document.createElement('div'); s.className = 'sources';
+      s.innerHTML = `<div class="meta">Sources</div>` + sources.map((src,i)=>{
+        const label = escapeHtml(src.title || src.doc_id || `Source ${i+1}`);
+        const href = src.uri || '#';
+        return `<div>[${i+1}] <a href="${href}" target="_blank" rel="noopener">${label}</a></div>`;
+      }).join('');
+      container.appendChild(s);
+    }
+
+    let controller = null;
+
+    async function send(){
+      store.save();
+      const text = promptEl.value.trim();
+      if (!text) return;
+
+      // Respect manual override in the Session field; otherwise use persisted
+      let sid = sidEl.value.trim();
+      if (!sid) {
+        sid = getOrCreateSessionId();
+        sidEl.value = sid;
+      } else {
+        localStorage.setItem('sessionid', sid);
+      }
+
+      const model = modelEl.value.trim() || 'gpt-5-mini';
+      const index = indexEl.value.trim() || 'schh';
+      const endpoint = endpointEl.value.trim() || '/chat';
+      const stream = !!streamToggle.checked;
+
+      addMessage('user', renderMD(escapeHtml(text)));
+      const ai = addMessage('ai', renderMD('_…thinking…_'));
+      const contentEl = ai.querySelector('.content');
+      let assistantMsg = '';
+
+      promptEl.value = '';
+      sendBtn.disabled = true; stopBtn.disabled = false;
+      controller = new AbortController();
+
+      const payload = { prompt: text, model, index, stream, sessionid: sid };
+      const t0 = performance.now();
+
+      try{
+        const res = await fetch(endpoint, {
+          method:'POST', signal:controller.signal,
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+        const isSSE = /text\/event-stream/i.test(res.headers.get('Content-Type')||'');
+
+        const handle = (obj)=>{
+          if (obj.type === 'content') {
+            assistantMsg += obj.delta || '';
+            contentEl.innerHTML = renderMD(assistantMsg);
+            log.scrollTop = log.scrollHeight;
+          } else if (obj.type === 'final') {
+            if (obj.sources?.length) addSources(ai, obj.sources);
+            if (!assistantMsg) contentEl.innerHTML = renderMD('_(no content)_');
+          } else if (obj.type === 'error') {
+            assistantMsg += `\n\n> [stream error] ${obj.message || ''}`;
+            contentEl.innerHTML = renderMD(assistantMsg);
+          } else if (obj.content) {
+            // raw concatenated JSON fallback
+            assistantMsg += obj.content;
+            contentEl.innerHTML = renderMD(assistantMsg);
           }
-        })
-      })
-    }
+        };
 
-    drawerEl.addEventListener('sl-show', () => getDrawerContent('about'))
+        while (true){
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream:true });
 
-    const settingsValues = { 
-      stream: true,
-      models: [
-        ['gpt-4o-mini', 'GPT 4o Mini'],
-        ['gpt-4o', 'GPT 4o'],
-        ['claude-3-sonnet-20240229', 'Claude 3.5 Sonnet']
-      ],
-      indexes:[
-        ['schh', 'schh'],
-        ['schh-pc', 'schh-pc'],
-        ['test', 'test']
-      ] 
-    }
-    const defaultSettings = { stream: true, model: 'gpt-4o-mini', index: 'schh' }
-    let settings = { ...defaultSettings }
-    const updateSettings = () => {
-      settings.stream = drawerEl.querySelector('#stream').checked
-      settings.model = drawerEl.querySelector('#model').value
-      settings.index = drawerEl.querySelector('#knowledgeBase').value
-      localStorage.setItem('settings', JSON.stringify(settings))
-    }
-    const getSettings = () => {
-      const savedSettings = localStorage.getItem('settings')
-      if (savedSettings) settings = { ...defaultSettings, ...JSON.parse(savedSettings) }
-      let settingsEl = drawerEl.querySelector('#settings')
-      let settingsHtml = `<sl-switch id="stream" ${settings.stream ? 'checked' : ''}>Stream response</sl-switch><br/>`
-      settingsHtml += `<div class="selector"><span>Model: </span><sl-select id="model" value="${settings.model}" hoist placement="bottom">`
-      settingsValues.models.forEach(([value, label]) => settingsHtml += `<sl-option value="${value}">${label}</sl-option>`)
-      settingsHtml += `</sl-select></div>`
-      settingsHtml += `<div class="selector"><span>Knowledge base: </span><sl-select id="knowledgeBase" value="${settings.index}" hoist placement="bottom">`
-      settingsValues.indexes.forEach(([value, label]) => settingsHtml += `<sl-option value="${value}">${label}</sl-option>`)
-      settingsHtml += `</sl-select></div>`
-      settingsEl.innerHTML = settingsHtml
-    } 
-    drawerEl.addEventListener('sl-hide', () => updateSettings())
-    
-    // Load icons and prompts
-    let [icons, prompts] = await Promise.all([
-      fetch('static/icons.yaml'),
-      fetch('static/prompts.yaml')
-    ])
-    .then(responses => Promise.all(responses.map(r => r.text())))
-    .then((responses => responses.map(r => jsyaml.load(r))))
-
-    const makeSvg = (name, color, size) => {
-      let svg = new DOMParser().parseFromString(icons[name], 'text/html').querySelector('svg')
-      svg.setAttribute('fill', color || '#444')
-      svg.setAttribute('height', size || '24px')
-      svg.setAttribute('width', size || '24px')
-      return svg
-    }
-
-    const addPrebuiltPrompts = () => {
-      let today = new Date().toISOString().slice(0, 10)
-      prompts.forEach(p => {
-        let promptButton = document.createElement('sl-button')
-        promptButton.textContent = p.label
-        promptButton.setAttribute('pill', '')
-        promptButton.setAttribute('size', isMobile ? 'small' : 'large')
-
-        let svg = makeSvg(p.icon, icons[p.iconColor], '16px')
-        svg.setAttribute('slot', 'prefix')
-        promptButton.appendChild(svg);
-
-        promptsEl.appendChild(promptButton)
-        promptButton.addEventListener('click', () => sendMessage(p.prompt.replace('{{today}}', today)))
-      })
-    }
-
-    const refresh = () => {
-      sessionid = Math.random().toString(36).substring(7)
-      msgCtr = 0
-      chatEl.innerHTML = ''
-      containerEl.style.height = '40%'
-      inputContainerEl.style.width = isMobile ? '100%' : '80%'
-      promptsEl.style.display = 'flex'
-    }
-    refreshButton.addEventListener('click', (e) => refresh())
-
-    // Initialize the chatbot
-    getSettings()
-    addPrebuiltPrompts(prompts)
-
-    const md2Html = (md) => marked.parse(md).replace(/^\s*<p>/, '').replace(/<\/p>\s*$/, '') // convert markdown to HTML    
-    const scrollToBottom = () => chatEl.scrollTop = chatEl.scrollHeight // scroll chat to bottom
-
-    const addTooltio = (el, text, placement) => {
-      let tooltip = document.createElement('sl-tooltip')
-      tooltip.content = text
-      tooltip.placement = placement || 'bottom'
-      tooltip.style = 'margin-left: 0.25rem;'
-      tooltip.appendChild(el)
-      return tooltip
-    }
-
-    Math.random().toString(36).substring(7) // generate a random session ID
-    const sendMessage = async (prompt) => {
-
-      prompt = prompt.trim()
-      if (prompt === '') return
-      
-      if (msgCtr === 0)  {  // first message
-        containerEl.style.height = '100%'
-        inputContainerEl.style.width = '100%'
-        promptsEl.style.display = 'none'
-      }
-
-      let msgId = `msg-${++msgCtr}`
-      let copyButton
-
-      let promptEl = document.createElement('div')
-      promptEl.setAttribute('class', 'message user-message')
-      promptEl.id = msgId
-      promptEl.textContent = prompt
-      chatEl.appendChild(promptEl)
-      scrollToBottom()
-
-      const resp = await fetch(`${apiEndpoint}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({...{ prompt, sessionid }, ...settings})
-      })
-
-      const reader = resp.body.getReader()
-      const decoder = new TextDecoder('utf-8')
-
-      let responseWrapperEl = document.createElement('div')
-      responseWrapperEl.setAttribute('class', 'response')
-
-      let responseEl = document.createElement('div')
-      responseEl.setAttribute('class', 'response')
-      responseEl.id = msgId
-      responseEl.innerHTML = '<sl-spinner></sl-spinner>'
-      responseWrapperEl.appendChild(responseEl)
-      
-      let responseMarkdownEl = document.createElement('div')
-      responseMarkdownEl.id = `md-${msgId}`
-      responseMarkdownEl.style.display = 'none'
-      responseWrapperEl.appendChild(responseMarkdownEl)
-
-      let toolsEl = document.createElement('div')
-      toolsEl.setAttribute('class', 'tools')
-      copyButton = document.createElement('sl-copy-button')
-      copyButton.content = prompt
-      copyButton.setAttribute('from', `md-${msgId}`)
-      copyButton.setAttribute('tooltip-placement', 'bottom')
-      // copyButton = addTooltio(copyButton, 'Copy response')
-      toolsEl.appendChild(copyButton)
-      responseWrapperEl.appendChild(toolsEl)
-      
-      chatEl.appendChild(responseWrapperEl)
-
-      let metadata = null
-      let response = []
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        let vals = decoder.decode(value).split('}{')
-        if (vals.length > 1) {
-          for (let idx = 0; idx < vals.length; idx++) {
-            if (idx === 0) vals[idx] += '}'
-            else if (idx === vals.length - 1) vals[idx] = '{' + vals[idx]
-            else vals[idx] = '{' + vals[idx] + '}'
+          if (isSSE) {
+            let idx;
+            while ((idx = buffer.indexOf('\n\n')) >= 0) {
+              const frame = buffer.slice(0, idx).trim();
+              buffer = buffer.slice(idx+2);
+              if (!frame.startsWith('data:')) continue;
+              const jsonStr = frame.slice(5).trim();
+              if (!jsonStr) continue;
+              try { handle(JSON.parse(jsonStr)); } catch {}
+            }
+          } else {
+            // concatenated JSON objects fallback
+            let start = 0, depth = 0, inStr = false, esc = false;
+            for (let i=0;i<buffer.length;i++){
+              const ch = buffer[i];
+              if (inStr){
+                if (esc){ esc=false; continue; }
+                if (ch === '\\'){ esc=true; continue; }
+                if (ch === '"') inStr=false;
+              } else {
+                if (ch === '"') inStr=true;
+                else if (ch === '{'){ if (depth===0) start=i; depth++; }
+                else if (ch === '}'){
+                  depth--; if (depth===0){
+                    const jsonStr = buffer.slice(start, i+1);
+                    try { handle(JSON.parse(jsonStr)); } catch {}
+                  }
+                }
+              }
+            }
+            buffer = depth===0 ? '' : buffer.slice(start);
           }
         }
 
-        vals.forEach(val => {
-          let content
-          try {
-            let respObj = JSON.parse(val)
-            if (respObj.metadata) metadata = respObj.metadata
-            else content = respObj.content !== undefined ? respObj.content : val
-          } catch (e) {
-            console.log(e)
-            content = val
-          }
-          if (response.length === 0) 'message bot-message'.split(' ').forEach(cls => responseEl.classList.add(cls))
-          response.push(content)
-          responseEl.innerHTML = md2Html(response.join(''))
-        })
-
-        scrollToBottom()
+        const dt = Math.round(performance.now() - t0);
+        const meta = document.createElement('div'); meta.className='meta'; meta.textContent = `${model} • ${dt} ms • sid:${sid}`;
+        ai.appendChild(meta);
+      } catch(err){
+        contentEl.innerHTML = renderMD(`**Error:** ${escapeHtml(err.message||String(err))}`);
+      } finally {
+        sendBtn.disabled = false; stopBtn.disabled = true; controller = null;
       }
-
-      if (metadata.sources?.length) {
-        let sources = document.createElement('sl-dropdown')
-        sources.className = 'sources'
-
-        let svg = makeSvg('list')
-        svg.setAttribute('slot', 'trigger')
-        sources.appendChild(svg)
-
-        let content = document.createElement('div')
-        let heading = document.createElement('h3')
-        heading.textContent = 'Sources'
-        content.appendChild(heading)
-        content.setAttribute('class', 'content')
-        let sourceList = document.createElement('ul')
-        content.appendChild(sourceList);
-        (metadata.sources || []).forEach(source => {
-          let sourceListItem = document.createElement('li')
-          sourceListItem.innerHTML = `<a href="${source.source}" target="_blank">${source.id.split('/').pop()}</a>`
-          sourceList.appendChild(sourceListItem)
-        })
-        sources.appendChild(content)
-        
-        sources = addTooltio(sources, 'Show sources')
-
-        toolsEl.appendChild(sources)
-      }
-
-      if (msgCtr > 1) copyButton.style.visibility = 'visible'
-      responseMarkdownEl.textContent = response.join('').split('\n').map(line => line.replace(/^#/g, '###')).join('\n')
     }
 
+    $('#send').addEventListener('click', send);
+    $('#prompt').addEventListener('keydown', (e)=>{ if (e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }});
+    $('#stop').addEventListener('click', ()=>{ if (controller) controller.abort(); stopBtn.disabled = true; });
   </script>
 </body>
 </html>
