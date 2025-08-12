@@ -47,7 +47,7 @@ log = logging.getLogger("schh-rag")
 
 DEFAULT_MODEL      = os.getenv("DEFAULT_MODEL", "gpt-5-mini")
 DEFAULT_INDEX      = os.getenv("DEFAULT_INDEX", "schh")
-DEFAULT_NAMESPACE  = os.getenv("DEFAULT_NAMESPACE", None)  # e.g., "schh"
+DEFAULT_NAMESPACE  = os.getenv("DEFAULT_NAMESPACE", 'schh_v2') 
 EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 ALLOW_ORIGINS = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",")]
