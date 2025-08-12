@@ -187,7 +187,7 @@
       const model = modelEl.value.trim() || 'gpt-5-mini';
       const index = indexEl.value.trim() || 'schh';
       const namespace = 'schh';
-      const endpoint = endpointEl.value.trim() || '/chat';
+      const endpoint = endpointEl.value.trim() || (location.hostname === 'localhost' ? '/chat' : 'https://ai-chatbot-fkiv.onrender.com/chat');
       const stream = !!streamToggle.checked;
 
       addMessage('user', renderMD(escapeHtml(text)));
