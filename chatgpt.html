@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Community AI Chat</title>
+  <style>
+    :root { --bg:#0f172a; --fg:#e2e8f0; --card:#0b1220; --muted:#94a3b8; --accent:#38bdf8; --border:#1f2937; }
+    html,body{height:100%}
+    body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    .wrap{max-width:960px;margin:0 auto;display:flex;flex-direction:column;height:100%}
+    header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center}
+    header h1{font-size:16px;font-weight:600;margin:0}
+    .pill{font-size:12px;color:var(--muted);padding:2px 8px;border:1px solid #334155;border-radius:999px}
+    main{flex:1;display:flex;min-height:0}
+    .panel{flex:1;display:flex;flex-direction:column}
+    .log{flex:1;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:14px}
+    .msg{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;max-width:78%}
+    .ai{align-self:flex-start}
+    .user{align-self:flex-end;background:#0a1424}
+    .meta{color:var(--muted);font-size:12px;margin-top:8px}
+    .sources{margin-top:12px;border-top:1px dashed var(--border);padding-top:10px}
+    .sources a{color:var(--accent);text-decoration:none}
+    .composer{display:flex;gap:10px;padding:12px;border-top:1px solid var(--border);background:#0b1220}
+    textarea{flex:1;resize:vertical;min-height:64px;max-height:220px;padding:10px;border-radius:10px;border:1px solid #334155;background:#0a1424;color:var(--fg)}
+    button{background:#0ea5e9;border:none;color:white;padding:10px 14px;border-radius:10px;cursor:pointer}
+    button[disabled]{opacity:.6;cursor:not-allowed}
+    .settings{display:flex;gap:10px;align-items:center;flex-wrap:wrap;color:var(--muted);padding:8px 12px;border-top:1px solid var(--border);background:#0b1220}
+    .settings input{background:#0a1424;color:var(--fg);border:1px solid #334155;border-radius:8px;padding:6px 8px}
+    .row{display:flex;gap:8px;align-items:center}
+    /* Markdown tweaks */
+    .content :is(h1,h2,h3){margin:12px 0 8px 0}
+    .content p{margin:8px 0}
+    .content ul{padding-left:22px}
+    .content code{background:#0f1a2d;padding:2px 6px;border-radius:6px}
+    .content pre{background:#0f1a2d;padding:10px;border-radius:10px;overflow:auto}
+    .content a{color:var(--accent)}
+  </style>
+  <!-- Markdown renderer + sanitizer -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Community AI Chat</h1>
+      <span class="pill">RAG</span>
+      <div style="margin-left:auto" class="row">
+        <label class="row" style="gap:6px">
+          <input type="checkbox" id="streamToggle" checked>
+          <span>Stream</span>
+        </label>
+      </div>
+    </header>
+
+    <main>
+      <div class="panel">
+        <div id="log" class="log"></div>
+
+        <div class="settings">
+          <div class="row">
+            <label for="model">Model</label>
+            <input id="model" value="gpt-5-mini" size="14" />
+          </div>
+          <div class="row">
+            <label for="index">Index</label>
+            <input id="index" value="schh" size="10" />
+          </div>
+          <div class="row">
+            <label for="endpoint">Endpoint</label>
+            <input id="endpoint" value="/chat" size="18" />
+          </div>
+          <div class="row">
+            <label for="sid">Session</label>
+            <input id="sid" value="" placeholder="auto (persisted)" size="22" />
+          </div>
+        </div>
+
+        <div class="composer">
+          <textarea id="prompt" placeholder="Ask a question…"></textarea>
+          <button id="send">Send</button>
+          <button id="stop" disabled>Stop</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const $ = sel => document.querySelector(sel);
+    const log = $('#log');
+    const promptEl = $('#prompt');
+    const sendBtn = $('#send');
+    const stopBtn = $('#stop');
+
+    const modelEl = $('#model');
+    const indexEl = $('#index');
+    const endpointEl = $('#endpoint');
+    const sidEl = $('#sid');
+    const streamToggle = $('#streamToggle');
+
+    // ---- Session id helpers ----
+    function randHex(len = 16) {
+      if (crypto?.getRandomValues) {
+        const buf = new Uint8Array(len/2);
+        crypto.getRandomValues(buf);
+        return [...buf].map(b => b.toString(16).padStart(2,'0')).join('');
+      }
+      return Math.random().toString(16).slice(2).padEnd(len, '0').slice(0, len);
+    }
+
+    function getOrCreateSessionId() {
+      let sid = localStorage.getItem('sessionid');
+      if (!sid) {
+        sid = randHex(16);
+        localStorage.setItem('sessionid', sid);
+      }
+      return sid;
+    }
+
+    // Persisted UI settings
+    const store = {
+      get k(){ return 'community-chat-settings' },
+      load(){ try{
+        const v = JSON.parse(localStorage.getItem(this.k)||'{}');
+        if (v.model) modelEl.value = v.model;
+        if (v.index) indexEl.value = v.index;
+        if (v.endpoint) endpointEl.value = v.endpoint;
+        if (typeof v.stream === 'boolean') streamToggle.checked = v.stream;
+      }catch{} },
+      save(){
+        const v = {
+          model:modelEl.value.trim(),
+          index:indexEl.value.trim(),
+          endpoint:endpointEl.value.trim(),
+          stream:streamToggle.checked
+        };
+        localStorage.setItem(this.k, JSON.stringify(v));
+      }
+    };
+    store.load();
+
+    // Initialize and display current session id
+    sidEl.value = getOrCreateSessionId();
+
+    function addMessage(role, html='') {
+      const div = document.createElement('div');
+      div.className = `msg ${role}`;
+      div.innerHTML = `<div class="content">${html}</div>`;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+      return div;
+    }
+
+    function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    function renderMD(markdown){
+      try { return DOMPurify.sanitize(marked.parse(markdown || '')); }
+      catch { return escapeHtml(markdown || ''); }
+    }
+
+    function addSources(container, sources){
+      if (!sources || !sources.length) return;
+      const s = document.createElement('div'); s.className = 'sources';
+      s.innerHTML = `<div class="meta">Sources</div>` + sources.map((src,i)=>{
+        const label = escapeHtml(src.title || src.doc_id || `Source ${i+1}`);
+        const href = src.uri || '#';
+        return `<div>[${i+1}] <a href="${href}" target="_blank" rel="noopener">${label}</a></div>`;
+      }).join('');
+      container.appendChild(s);
+    }
+
+    let controller = null;
+
+    async function send(){
+      store.save();
+      const text = promptEl.value.trim();
+      if (!text) return;
+
+      // Respect manual override in the Session field; otherwise use persisted
+      let sid = sidEl.value.trim();
+      if (!sid) {
+        sid = getOrCreateSessionId();
+        sidEl.value = sid;
+      } else {
+        localStorage.setItem('sessionid', sid);
+      }
+
+      const model = modelEl.value.trim() || 'gpt-5-mini';
+      const index = indexEl.value.trim() || 'schh';
+      const namespace = 'schh';
+      const endpoint = endpointEl.value.trim() || (location.hostname === 'localhost' ? '/chat' : 'https://ai-chatbot-fkiv.onrender.com/chat');
+      const stream = !!streamToggle.checked;
+
+      addMessage('user', renderMD(escapeHtml(text)));
+      const ai = addMessage('ai', renderMD('_…thinking…_'));
+      const contentEl = ai.querySelector('.content');
+      let assistantMsg = '';
+
+      promptEl.value = '';
+      sendBtn.disabled = true; stopBtn.disabled = false;
+      controller = new AbortController();
+
+      const payload = { prompt: text, model, index, namespace, stream, sessionid: sid };
+      const t0 = performance.now();
+
+      try {
+        const res = await fetch(endpoint, {
+          method:'POST', signal:controller.signal,
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+        const isSSE = /text\/event-stream/i.test(res.headers.get('Content-Type')||'');
+
+        const handle = (obj)=>{
+          if (obj.type === 'content') {
+            assistantMsg += obj.delta || '';
+            contentEl.innerHTML = renderMD(assistantMsg);
+            log.scrollTop = log.scrollHeight;
+          } else if (obj.type === 'final') {
+            if (obj.sources?.length) addSources(ai, obj.sources);
+            if (!assistantMsg) contentEl.innerHTML = renderMD('_(no content)_');
+          } else if (obj.type === 'error') {
+            assistantMsg += `\n\n> [stream error] ${obj.message || ''}`;
+            contentEl.innerHTML = renderMD(assistantMsg);
+          } else if (obj.content) {
+            // raw concatenated JSON fallback
+            assistantMsg += obj.content;
+            contentEl.innerHTML = renderMD(assistantMsg);
+          }
+        };
+
+        while (true){
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream:true });
+
+          if (isSSE) {
+            let idx;
+            while ((idx = buffer.indexOf('\n\n')) >= 0) {
+              const frame = buffer.slice(0, idx).trim();
+              buffer = buffer.slice(idx+2);
+              if (!frame.startsWith('data:')) continue;
+              const jsonStr = frame.slice(5).trim();
+              if (!jsonStr) continue;
+              try { handle(JSON.parse(jsonStr)); } catch {}
+            }
+          } else {
+            // concatenated JSON objects fallback
+            let start = 0, depth = 0, inStr = false, esc = false;
+            for (let i=0;i<buffer.length;i++){
+              const ch = buffer[i];
+              if (inStr){
+                if (esc){ esc=false; continue; }
+                if (ch === '\\'){ esc=true; continue; }
+                if (ch === '"') inStr=false;
+              } else {
+                if (ch === '"') inStr=true;
+                else if (ch === '{'){ if (depth===0) start=i; depth++; }
+                else if (ch === '}'){
+                  depth--; if (depth===0){
+                    const jsonStr = buffer.slice(start, i+1);
+                    try { handle(JSON.parse(jsonStr)); } catch {}
+                  }
+                }
+              }
+            }
+            buffer = depth===0 ? '' : buffer.slice(start);
+          }
+        }
+
+        const dt = Math.round(performance.now() - t0);
+        const meta = document.createElement('div'); meta.className='meta'; meta.textContent = `${model} • ${dt} ms • sid:${sid}`;
+        ai.appendChild(meta);
+      } catch(err){
+        contentEl.innerHTML = renderMD(`**Error:** ${escapeHtml(err.message||String(err))}`);
+      } finally {
+        sendBtn.disabled = false; stopBtn.disabled = true; controller = null;
+      }
+    }
+
+    $('#send').addEventListener('click', send);
+    $('#prompt').addEventListener('keydown', (e)=>{ if (e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }});
+    $('#stop').addEventListener('click', ()=>{ if (controller) controller.abort(); stopBtn.disabled = true; });
+  </script>
+</body>
+</html>

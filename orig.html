@@ -130,11 +130,9 @@
   </footer>
 
   <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
-    <!-- Markdown renderer + sanitizer -->
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
-
   <script type="module">
+
+    import { marked } from "https://cdn.jsdelivr.net/npm/marked/lib/marked.esm.js";
 
     // import any needed Shoelace components (https://shoelace.style/)
     import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/button/button.js';
@@ -173,7 +171,7 @@
     submitEl.addEventListener('click', (e) => { 
       let message = inputEl.value.trim()
       inputEl.value = ''
-      if (message !== '') send(message)
+      if (message !== '') sendMessage(message)
       if (!isMobile) inputEl.focus()
     })
     inputEl.addEventListener('keydown', (e) => { 
@@ -206,26 +204,22 @@
     const settingsValues = { 
       stream: true,
       models: [
-        ['gpt-5-mini', 'GPT 5 Mini'],
-        ['gpt-5-nano', 'GPT 5 Nano'],
-        ['gpt-5', 'GPT 5'],
         ['gpt-4o-mini', 'GPT 4o Mini'],
-        ['gpt-4o', 'GPT 4o']
+        ['gpt-4o', 'GPT 4o'],
+        ['claude-3-sonnet-20240229', 'Claude 3.5 Sonnet']
       ],
       indexes:[
-        ['schh', 'schh']
-      ],
-      namespaces:[
-        ['schh', 'schh']
+        ['schh', 'schh'],
+        ['schh-pc', 'schh-pc'],
+        ['test', 'test']
       ] 
     }
-    const defaultSettings = { stream: true, model: 'gpt-5-mini', index: 'schh', namespace: 'schh' }
+    const defaultSettings = { stream: true, model: 'gpt-4o-mini', index: 'schh' }
     let settings = { ...defaultSettings }
     const updateSettings = () => {
       settings.stream = drawerEl.querySelector('#stream').checked
       settings.model = drawerEl.querySelector('#model').value
       settings.index = drawerEl.querySelector('#knowledgeBase').value
-      settings.namespace = 'schh'
       localStorage.setItem('settings', JSON.stringify(settings))
     }
     const getSettings = () => {
@@ -272,7 +266,7 @@
         promptButton.appendChild(svg);
 
         promptsEl.appendChild(promptButton)
-        promptButton.addEventListener('click', () => send(p.prompt.replace('{{today}}', today)))
+        promptButton.addEventListener('click', () => sendMessage(p.prompt.replace('{{today}}', today)))
       })
     }
 
@@ -302,179 +296,7 @@
       return tooltip
     }
 
-    // ---- Session id helpers ----
-    function randHex(len = 16) {
-      if (crypto?.getRandomValues) {
-        const buf = new Uint8Array(len/2);
-        crypto.getRandomValues(buf);
-        return [...buf].map(b => b.toString(16).padStart(2,'0')).join('');
-      }
-      return Math.random().toString(16).slice(2).padEnd(len, '0').slice(0, len);
-    }
-
-    function getOrCreateSessionId() {
-      let sid = localStorage.getItem('sessionid');
-      if (!sid) {
-        sid = randHex(16);
-        localStorage.setItem('sessionid', sid);
-      }
-      return sid;
-    }
-
-    // Initialize and display current session id
-    // sidEl.value = getOrCreateSessionId();
-    
-    function addMessage(role, html='') {
-      if (msgCtr++ === 0)  {  // first message
-        containerEl.style.height = '100%'
-        inputContainerEl.style.width = '100%'
-        promptsEl.style.display = 'none'
-      }
-
-      const div = document.createElement('div');
-      div.className = `msg ${role}`;
-      div.innerHTML = `<div class="content">${html}</div>`;
-      chatEl.appendChild(div);
-      chatEl.scrollTop = chatEl.scrollHeight;
-      return div;
-    }
-
-    function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-    function renderMD(markdown){
-      try { return DOMPurify.sanitize(marked.parse(markdown || '')); }
-      catch { return escapeHtml(markdown || ''); }
-    }
-
-    function addSources(container, sources){
-      if (!sources || !sources.length) return;
-      const s = document.createElement('div'); s.className = 'sources';
-      s.innerHTML = `<div class="meta">Sources</div>` + sources.map((src,i)=>{
-        const label = escapeHtml(src.title || src.doc_id || `Source ${i+1}`);
-        const href = src.uri || '#';
-        return `<div>[${i+1}] <a href="${href}" target="_blank" rel="noopener">${label}</a></div>`;
-      }).join('');
-      container.appendChild(s);
-    }
-
-
-    let controller = null;
-
-    async function send(text){
-      // store.save();
-      // const text = promptEl.value.trim();
-      if (!text) return;
-
-      // Respect manual override in the Session field; otherwise use persisted
-      /*
-      let sid = sidEl.value.trim();
-      if (!sid) {
-        sid = getOrCreateSessionId();
-        sidEl.value = sid;
-      } else {
-        localStorage.setItem('sessionid', sid);
-      }
-      */
-
-      let sessionid = getOrCreateSessionId(); 
-
-      const model = 'gpt-5-mini';
-      const index = 'schh';
-      const namespace = 'schh';
-      const endpoint = location.hostname === 'localhost' ? '/chat' : 'https://ai-chatbot-fkiv.onrender.com/chat';
-      const stream = true;
-
-      addMessage('user', renderMD(escapeHtml(text)));
-      const ai = addMessage('ai', renderMD('_…thinking…_'));
-      const contentEl = ai.querySelector('.content');
-      let assistantMsg = '';
-
-      // promptEl.value = '';
-      // sendBtn.disabled = true; stopBtn.disabled = false;
-      controller = new AbortController();
-
-      const payload = { prompt: text, model, index, namespace, stream, sessionid };
-      const t0 = performance.now();
-
-      try {
-        const res = await fetch(endpoint, {
-          method:'POST', signal:controller.signal,
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify(payload)
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder('utf-8');
-        let buffer = '';
-        const isSSE = /text\/event-stream/i.test(res.headers.get('Content-Type')||'');
-
-        const handle = (obj)=>{
-          if (obj.type === 'content') {
-            assistantMsg += obj.delta || '';
-            contentEl.innerHTML = renderMD(assistantMsg);
-            log.scrollTop = log.scrollHeight;
-          } else if (obj.type === 'final') {
-            if (obj.sources?.length) addSources(ai, obj.sources);
-            if (!assistantMsg) contentEl.innerHTML = renderMD('_(no content)_');
-          } else if (obj.type === 'error') {
-            assistantMsg += `\n\n> [stream error] ${obj.message || ''}`;
-            contentEl.innerHTML = renderMD(assistantMsg);
-          } else if (obj.content) {
-            // raw concatenated JSON fallback
-            assistantMsg += obj.content;
-            contentEl.innerHTML = renderMD(assistantMsg);
-          }
-        };
-
-        while (true){
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream:true });
-
-          if (isSSE) {
-            let idx;
-            while ((idx = buffer.indexOf('\n\n')) >= 0) {
-              const frame = buffer.slice(0, idx).trim();
-              buffer = buffer.slice(idx+2);
-              if (!frame.startsWith('data:')) continue;
-              const jsonStr = frame.slice(5).trim();
-              if (!jsonStr) continue;
-              try { handle(JSON.parse(jsonStr)); } catch {}
-            }
-          } else {
-            // concatenated JSON objects fallback
-            let start = 0, depth = 0, inStr = false, esc = false;
-            for (let i=0;i<buffer.length;i++){
-              const ch = buffer[i];
-              if (inStr){
-                if (esc){ esc=false; continue; }
-                if (ch === '\\'){ esc=true; continue; }
-                if (ch === '"') inStr=false;
-              } else {
-                if (ch === '"') inStr=true;
-                else if (ch === '{'){ if (depth===0) start=i; depth++; }
-                else if (ch === '}'){
-                  depth--; if (depth===0){
-                    const jsonStr = buffer.slice(start, i+1);
-                    try { handle(JSON.parse(jsonStr)); } catch {}
-                  }
-                }
-              }
-            }
-            buffer = depth===0 ? '' : buffer.slice(start);
-          }
-        }
-
-        const dt = Math.round(performance.now() - t0);
-        const meta = document.createElement('div'); meta.className='meta'; meta.textContent = `${model} • ${dt} ms • sid:${sessionid}`;
-        ai.appendChild(meta);
-      } catch(err){
-        contentEl.innerHTML = renderMD(`**Error:** ${escapeHtml(err.message||String(err))}`);
-      } finally {
-        // sendBtn.disabled = false; stopBtn.disabled = true; controller = null;
-      }
-    }
-
+    Math.random().toString(36).substring(7) // generate a random session ID
     const sendMessage = async (prompt) => {
 
       prompt = prompt.trim()
@@ -504,8 +326,6 @@
 
       const reader = resp.body.getReader()
       const decoder = new TextDecoder('utf-8')
-      let buffer = '';
-      const isSSE = /text\/event-stream/i.test(res.headers.get('Content-Type')||'');
 
       let responseWrapperEl = document.createElement('div')
       responseWrapperEl.setAttribute('class', 'response')
