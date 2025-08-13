@@ -219,13 +219,13 @@
         ['schh_v2', 'schh_v2']
       ] 
     }
-    const defaultSettings = { stream: true, model: 'gpt-5-mini', index: 'schh', namespace: 'schh' }
+    const defaultSettings = { stream: true, model: 'gpt-5-mini', index: 'schh', namespace: 'schh_v2' }
     let settings = { ...defaultSettings }
     const updateSettings = () => {
       settings.stream = drawerEl.querySelector('#stream').checked
       settings.model = drawerEl.querySelector('#model').value
       settings.index = drawerEl.querySelector('#knowledgeBase').value
-      settings.namespace = 'schh'
+      settings.namespace = 'schh_v2'
       localStorage.setItem('settings', JSON.stringify(settings))
     }
     const getSettings = () => {
@@ -379,7 +379,7 @@
 
       const model = 'gpt-5-mini';
       const index = 'schh';
-      const namespace = 'schh';
+      const namespace = 'schh_v2';
       const endpoint = location.hostname === 'localhost' ? '/chat' : 'https://ai-chatbot-fkiv.onrender.com/chat';
       const stream = true;
 

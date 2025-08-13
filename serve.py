@@ -16,6 +16,9 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from threading import RLock
 
+from collections import deque
+from threading import RLock
+
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -30,6 +33,7 @@ from langchain_core.tools import tool
 from langchain_core.messages.ai import AIMessageChunk
 
 from pinecone import Pinecone
+from pinecone.core.openapi.shared.exceptions import PineconeApiException
 
 # Optional: hybrid sparse encoder (BM25)
 try:
@@ -63,9 +67,64 @@ SYSTEM_PROMPT = (
     "If unsure, say so briefly."
 )
 
+# Personality / formatting knobs
+TONE = os.getenv("TONE", "warm, succinct, community-friendly, helpful but not chatty")
+VOICE_RULES = os.getenv("VOICE_RULES", (
+    "Be friendly and clear. Use plain language. Avoid fluff. "
+    "Use a light touch of personality (one short friendly line or emoji when appropriate), "
+    "but keep the focus on helpful content."
+))
+STYLE_RULES = os.getenv("STYLE_RULES", (
+    "Always format in Markdown with:\n"
+    "- A short **TL;DR** (1–2 lines) at the top.\n"
+    "- Then **Key points** as bullets (2–6 items).\n"
+    "- If procedural, add a **Steps** list.\n"
+    "- Use callouts: **Note:**, **Tip:**, **Warning:** as bold labels.\n"
+    "- Use tables when comparing options.\n"
+    "- Keep line length reasonable; add blank lines between sections.\n"
+))
+
+SPEED_MODE = os.getenv("SPEED_MODE", "1") == "1"  # default fast
+RETR_TOP_K = int(os.getenv("RETR_TOP_K", "30" if SPEED_MODE else "50"))
+DOCS_MAX   = int(os.getenv("DOCS_MAX", "4"  if SPEED_MODE else "6"))
+CHUNKS_PER_DOC = int(os.getenv("CHUNKS_PER_DOC", "2" if SPEED_MODE else "3"))
+MERGED_MAX_CHARS = int(os.getenv("MERGED_MAX_CHARS", "2500" if SPEED_MODE else "3500"))
+USE_GAP_EXTRACTOR = os.getenv("USE_GAP_EXTRACTOR", "0" if SPEED_MODE else "1") == "1"
+SIBS_MAX = int(os.getenv("SIBS_MAX", "2"))           # siblings per hit
+MAX_EXTRAS = int(os.getenv("MAX_EXTRAS", "300"))     # global cap per request
+
 embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
 pc = Pinecone()
 memory = MemorySaver()
+
+# --- simple in‑process conversation store ---
+SESSIONS: dict[str, deque[dict]] = {}
+SESSIONS_LOCK = RLock()
+MAX_TURNS = 8  # number of prior user/assistant turns to keep per session
+
+def get_history(sessionid: str) -> deque[dict]:
+    with SESSIONS_LOCK:
+        if sessionid not in SESSIONS:
+            SESSIONS[sessionid] = deque(maxlen=2*MAX_TURNS)  # each turn ~2 msgs
+        return SESSIONS[sessionid]
+
+def append_msg(sessionid: str, role: str, content: str) -> None:
+    with SESSIONS_LOCK:
+        get_history(sessionid).append({"role": role, "content": content})
+
+def build_messages_with_history(sessionid: str, system_prompt: str, current_user_msg: str) -> list[dict]:
+    """
+    Returns: [system] + prior history (user/assistant pairs) + [current user]
+    We only inject the RAG context into *current_user_msg* to avoid polluting history.
+    """
+    msgs = [{"role": "system", "content": system_prompt}]
+    prior = list(get_history(sessionid))
+    # Optionally clamp in case someone changed MAX_TURNS
+    if len(prior) > 2*MAX_TURNS:
+        prior = prior[-2*MAX_TURNS:]
+    msgs.extend(prior)
+    msgs.append({"role": "user", "content": current_user_msg})
+    return msgs
 
 # -----------------------------------------------------------------------------
 # Utils
@@ -162,6 +221,39 @@ def get_bm25():
         log.warning(f"[hybrid] failed to load BM25 encoder: {e}")
         return None
 
+def fetch_texts_batch(index_name: str, namespace: Optional[str], ids: list[str]) -> dict[str, str]:
+    """Fetch metadata.text for ids using small batches; degrade gracefully on errors."""
+    out: dict[str, str] = {}
+    if not ids:
+        return out
+    idx = pc.Index(index_name)
+
+    # conservative batch size: 100 ids to avoid URL bloat (fetch is GET under the hood)
+    batch = 100
+    i = 0
+    while i < len(ids):
+        subset = ids[i:i+batch]
+        try:
+            res = idx.fetch(ids=subset, namespace=namespace)
+            vectors = (res or {}).get("vectors", {}) if isinstance(res, dict) else getattr(res, "vectors", {})
+            for vid, v in (vectors or {}).items():
+                md = v.get("metadata") if isinstance(v, dict) else getattr(v, "metadata", {}) or {}
+                txt = (md or {}).get("text")
+                if txt:
+                    out[vid] = txt
+            i += batch
+        except PineconeApiException as e:
+            # If we hit 414 or similar, halve the batch and retry; if too small, give up gracefully
+            if getattr(e, "status", None) == 414 and batch > 10:
+                batch //= 2
+                continue
+            # Non-recoverable or still failing with tiny batches — return what we have
+            break
+        except Exception:
+            # Don’t fail the whole request if fetch struggles; just return partials
+            break
+    return out
+
 # -----------------------------------------------------------------------------
 # Agent builder (cached per (model,index,namespace))
 # -----------------------------------------------------------------------------
@@ -173,7 +265,8 @@ def build_agent(model: str, index_name: str, namespace: Optional[str]):
 
     # Main LLM
     if model.startswith(("gpt-", "o")):
-        llm = ChatOpenAI(model=model, temperature=FORCED_TEMP)
+        llm = ChatOpenAI(model=model, temperature=FORCED_TEMP, max_tokens=600)  # tune 400–800
+
     else:
         if not os.getenv("ANTHROPIC_API_KEY"):
             raise RuntimeError("ANTHROPIC_API_KEY not set but Anthropic model requested")
@@ -330,22 +423,24 @@ def get_agent(model: str, index_name: str, namespace: Optional[str]):
         return build_agent(model, index_name, namespace)
 
 def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> Dict[str, Any]:
+    # 1) Encode
     dense_q = embeddings.embed_query(query)
     bm25 = get_bm25()
     sparse_q = bm25.encode_queries([query])[0] if bm25 else None
 
+    # 2) Hybrid query
     pine = pc.Index(index_name)
     resp = pine.query(
         vector=dense_q,
         sparse_vector=sparse_q,
-        top_k=50,
+        top_k=RETR_TOP_K,
         include_metadata=True,
         alpha=HYBRID_ALPHA,
         namespace=namespace,
     )
     matches = resp.get("matches", []) if isinstance(resp, dict) else getattr(resp, "matches", [])
 
-    # Wrap matches
+    # 3) Wrap + group chunks by base doc, cap CHUNKS_PER_DOC
     docs = []
     for m in matches or []:
         mid = m.get("id") if isinstance(m, dict) else getattr(m, "id", "")
@@ -355,54 +450,84 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
         d.id, d.metadata, d.page_content = mid, md, txt
         docs.append(d)
 
-    # Group per base doc, cap 3 chunks/doc
-    by_doc = {}
+    by_doc: Dict[str, List] = {}
     for d in docs:
         base_id = (d.id or "").rsplit(":", 1)[0]
-        if not base_id: 
+        if not base_id:
             continue
         by_doc.setdefault(base_id, [])
-        if len(by_doc[base_id]) < 3:
+        if len(by_doc[base_id]) < CHUNKS_PER_DOC:
             by_doc[base_id].append(d)
 
+    # 4) Batch collect parent/sibling ids (LIMITED)
+    need_ids = []
+    for chunks in by_doc.values():
+        for doc in chunks:
+            md = getattr(doc, "metadata", {}) or {}
+            pid = md.get("parent_id")
+            if pid:
+                need_ids.append(pid)
+            sibs = md.get("sib_ids", []) or []
+            if SIBS_MAX > 0 and sibs:
+                need_ids.extend(sibs[:SIBS_MAX])  # only take a few
+    # de-dupe and cap
+    need_ids = list(dict.fromkeys(need_ids))[:MAX_EXTRAS]
+    
+    try:
+        extras = fetch_texts_batch(index_name, namespace, need_ids)
+    except Exception:
+        extras = {}
+
+    # 5) Merge + sentence-aware compress
     merged_docs = []
     for base_id, chunks in by_doc.items():
         texts = []
         for doc in chunks:
             if getattr(doc, "page_content", None):
                 texts.append(doc.page_content)
-            meta = getattr(doc, "metadata", {}) or {}
-            pid = meta.get("parent_id")
-            if pid:
-                t = get_text_cached(pid, index_name, namespace)
-                if t: texts.append(t)
-            for sid in meta.get("sib_ids", []) or []:
-                t = get_text_cached(sid, index_name, namespace)
-                if t: texts.append(t)
-        merged = sentaware_compress(texts, max_chars=3500)
+            md = getattr(doc, "metadata", {}) or {}
+            pid = md.get("parent_id")
+            if pid and pid in extras:
+                texts.append(extras[pid])
+            for sid in md.get("sib_ids", []) or []:
+                if sid in extras:
+                    texts.append(extras[sid])
+        merged = sentaware_compress(texts, max_chars=MERGED_MAX_CHARS)
         if chunks:
             d0 = chunks[0]
             d0.page_content = merged
             merged_docs.append(d0)
 
-    # If nothing found, return empty
     if not merged_docs:
         return {"context_md": "", "sources": []}
 
-    # Simple rerank: keep first 6 (you can keep your LLM rerank if you want)
-    top = merged_docs[:6]
+    # 6) MMR‑lite doc selection (no LLM re‑rank)
+    selected = []
+    seen = set()
+    for d in merged_docs:
+        # Favor diversity by skipping near-duplicates
+        keep = True
+        for s in selected:
+            if tokenish_overlap(d.page_content, s.page_content) > 0.7:
+                keep = False
+                break
+        if keep:
+            selected.append(d)
+        if len(selected) >= DOCS_MAX:
+            break
 
-    # Build Markdown context + sources list
+    top = selected or merged_docs[:DOCS_MAX]
+
+    # 7) Build Markdown context + sources
     ctx_parts, sources = [], []
     for i, d in enumerate(top, 1):
         title = (getattr(d, "metadata", {}) or {}).get("title") or (d.id or "")
         uri   = (getattr(d, "metadata", {}) or {}).get("source")
         ctx_parts.append(f"### [{i}] {title}\n{getattr(d, 'page_content', '')}")
-        base_id = (d.id or "").rsplit(":", 1)[0]
-        if not any(s.get("doc_id")==base_id for s in sources):
-            sources.append({"doc_id": base_id, "title": title, "uri": uri})
+        base = (d.id or "").rsplit(":", 1)[0]
+        if not any(s.get("doc_id")==base for s in sources):
+            sources.append({"doc_id": base, "title": title, "uri": uri})
     context_md = "\n\n".join(ctx_parts)
-
     return {"context_md": context_md, "sources": sources}
 
 # -----------------------------------------------------------------------------
@@ -524,6 +649,22 @@ def non_stream_response(agent, messages, config, model: str, index: str, namespa
         "latency_ms": latency
     })
 
+def extract_gaps_for_general(prompt: str, context_md: str, llm, max_chars: int = 2500) -> list[str]:
+    """Ask the LLM to list missing needs so general guidance can target gaps."""
+    gap_prompt = (
+        "List 3–6 short items the answer would need that are NOT present in the provided context. "
+        "Return a JSON array of short noun-phrases or questions. Do not repeat items covered by the context.\n\n"
+        f"User query:\n{prompt}\n\nContext (truncated):\n{context_md[:max_chars]}"
+    )
+    try:
+        resp = llm.invoke([{"role":"user","content":gap_prompt}])
+        items = json.loads(getattr(resp, "content", "[]"))
+        if isinstance(items, list):
+            return [str(x)[:120] for x in items][:6]
+    except Exception:
+        pass
+    return []
+
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
@@ -538,43 +679,77 @@ async def chat_post(request: Request):
     stream    = bool(payload.get("stream", False))
     sessionid = payload.get("sessionid", secrets.token_hex(4))
 
-    # Force retrieval first
+    # 1) Force retrieval first
     ctx = retrieve_context(prompt, index, namespace)
-    context_md = ctx["context_md"]
-    sources = ctx["sources"]
+    context_md, sources = ctx["context_md"], ctx["sources"]
 
-    # If no context, we can still answer, but say we found nothing
-    preface = (
-        "No relevant documents were found in the knowledge base. "
-        "If you still answer, be explicit that you're using general knowledge."
-        if not context_md else
-        "Use ONLY the context below where possible. Cite with [1], [2] matching the section headers."
-    )
-
-    system = SYSTEM_PROMPT
-    user   = f"{preface}\n\n# User query\n{prompt}\n\n# Context\n{context_md}\n"
-
-    # Call the model directly (no need to rely on tools anymore)
+    # 2) Choose LLM
     if model.startswith(("gpt-", "o")):
-        llm = ChatOpenAI(model=model, temperature=FORCED_TEMP)
+        llm = ChatOpenAI(model=model, temperature=1)
     else:
         llm = ChatAnthropic(model_name=model)
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": user},
-    ]
+    # 3) Optional: gap targeting for (General) items
+    gaps = extract_gaps_for_general(prompt, context_md, llm) if (context_md and USE_GAP_EXTRACTOR) else []
+    
+    answering_rules = """
+    # Answering Rules (Blend Mode)
+    1) The SCHH/context is the source of truth for local rules, procedures, contacts, and exceptions.
+    2) You MAY add general best-practice/background items only to fill gaps. Prefix each such line with "(General)".
+    3) If general guidance conflicts with SCHH/context, omit it. If relevant, say: "SCHH guidance overrides general guidance."
+    4) Cite ONLY SCHH/context items using bracketed numbers [1], [2] that map to the provided context sections.
+    5) Do NOT include a separate 'Sources' or 'References' section; the app will render sources from metadata.
+    6) If the SCHH/context lacks key info, say what's missing, then add targeted (General) items.
+    7) Do NOT invent local names, phone numbers, or rules; include those only if present in SCHH/context.
+    8) Structure: SCHH-specific guidance (with citations) first, then "(General) additions)" (no citations).
+    """
+
+    tone_rules = f"# Tone\nWrite with a {TONE} tone. {VOICE_RULES}"
+    style_rules = f"# Formatting\n{STYLE_RULES}"
+
+    gap_hint = f"\nFocus (General) additions on these unmet needs: {', '.join(gaps)}\n" if gaps else ""
+    preface = (
+        "No relevant SCHH/context was found. If you answer, explicitly note you're using general knowledge only."
+        if not context_md else
+        "Use the SCHH/context where available. Add (General) items only for gaps."
+)
+
+    # 4) Build the *current* user message with RAG context
+    user_msg_current = (
+        f"{tone_rules}\n{style_rules}\n"
+        f"{answering_rules}\n"
+        f"{gap_hint}"
+        f"# User query\n{prompt}\n\n"
+        f"# SCHH/Context Sections\n{context_md}\n"
+        f"# Output format\n"
+        f"- Start with **TL;DR** (1–2 lines)\n"
+        f"- Then **Key points** (bullets)\n"
+        f"- Add **Steps** if procedural\n"
+        f"- Use inline citations like [1], [2] where relevant\n"
+        f"- Do **not** include a 'Sources' section (the app shows sources separately)\n"
+    )
+
+    # 5) Build messages with *prior* history for this sessionid
+    messages = build_messages_with_history(sessionid, SYSTEM_PROMPT, user_msg_current)
+
+    # 6) Append the raw user prompt (not the big injected one) to history
+    append_msg(sessionid, "user", prompt)
 
     if stream:
         async def gen():
             # initial heartbeat
             yield sse({"type": "content", "delta": ""})
+            final_text_parts = []
             async for chunk in llm.astream(messages):
                 text = getattr(chunk, "content", None)
                 if isinstance(text, list):
                     text = "".join([seg.get("text","") for seg in text if isinstance(seg, dict)])
                 if text:
+                    final_text_parts.append(text)
                     yield sse({"type": "content", "delta": text})
+            final_text = "".join(final_text_parts)
+            # store assistant reply to session history
+            append_msg(sessionid, "assistant", final_text)
             yield sse({"type": "final", "sources": sources})
         headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
         return StreamingResponse(gen(), headers=headers)
@@ -582,7 +757,9 @@ async def chat_post(request: Request):
     # non-stream
     resp = llm.invoke(messages)
     answer = getattr(resp, "content", "")
+    append_msg(sessionid, "assistant", answer)
     return JSONResponse({"answer": answer, "sources": sources, "model": model, "index": index, "namespace": namespace})
+
 # Optional GET route kept for compatibility
 @app.get("/chat/{prompt}")
 async def chat_get(prompt: str, request: Request,
