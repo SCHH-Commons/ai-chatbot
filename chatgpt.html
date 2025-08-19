@@ -86,6 +86,7 @@
   </div>
 
   <script>
+    console.log("Community AI Chat - RAG demo");
     const $ = sel => document.querySelector(sel);
     const log = $('#log');
     const promptEl = $('#prompt');
@@ -161,6 +162,7 @@
       if (!sources || !sources.length) return;
       const s = document.createElement('div'); s.className = 'sources';
       s.innerHTML = `<div class="meta">Sources</div>` + sources.map((src,i)=>{
+        console.log(src)
         const label = escapeHtml(src.title || src.doc_id || `Source ${i+1}`);
         const href = src.uri || '#';
         return `<div>[${i+1}] <a href="${href}" target="_blank" rel="noopener">${label}</a></div>`;

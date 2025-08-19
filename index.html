@@ -23,9 +23,9 @@
     
     .chat-container { position: relative; width: 100%; height: 40%; display: flex; flex-direction: column; overflow: hidden; margin: 0 auto; }
     .chat-area { flex: 1; padding: 1.5em .5em .5em .5em; overflow-y: scroll; display: flex; flex-direction: column; gap: 12px; }
-    .message { padding: 10px 14px; border-radius: 8px; line-height: 1.5; }
-    .user-message { align-self: flex-end; background-color: #ededed; color: #444; }
-    .bot-message { align-self: flex-start; background-color: #fff; color: #444;}
+    .msg { padding: 10px 14px; border-radius: 8px; line-height: 1.5; }
+    .user { align-self: flex-end; background-color: #ededed; color: #444; }
+    .ai { align-self: flex-start; background-color: #fff; color: #444;}
     .prompts { display: flex; gap: 0.5em; justify-content: center; padding: 0.5em; width: 100%; margin: auto; }
     .chat-textarea { flex: 1; min-height: 40px; max-height: 150px; overflow-y: auto; }
     .advisory { flex: 1; padding: 0.5em .5em 1em .5em; font-size: 0.8em; text-align: center; }
@@ -74,6 +74,9 @@
 
     .sources svg { width: 20px; height: 20px; fill: rgb(136, 136, 136); margin-top: 6px; cursor: pointer; }
     pre { white-space: pre-wrap; word-wrap: break-word; }
+    .thinking { display: flex; align-items: center; gap: 0.5em; }
+    .thinking p { display: inline; margin: 0; font-style: italic; color: #888; font-size: 0.9em; }
+    .meta { margin-top: 0.5em; font-size: 0.8em; color: #888; }
   </style>
 </head>
 <body>
@@ -216,16 +219,16 @@
         ['schh', 'schh']
       ],
       namespaces:[
-        ['schh_v2', 'schh_v2']
+        ['schh', 'schh']
       ] 
     }
-    const defaultSettings = { stream: true, model: 'gpt-5-mini', index: 'schh', namespace: 'schh_v2' }
+    const defaultSettings = { stream: true, model: 'gpt-5-mini', index: 'schh', namespace: 'schh' }
     let settings = { ...defaultSettings }
     const updateSettings = () => {
       settings.stream = drawerEl.querySelector('#stream').checked
       settings.model = drawerEl.querySelector('#model').value
       settings.index = drawerEl.querySelector('#knowledgeBase').value
-      settings.namespace = 'schh_v2'
+      settings.namespace = 'schh'
       localStorage.setItem('settings', JSON.stringify(settings))
     }
     const getSettings = () => {
@@ -349,6 +352,7 @@
       if (!sources || !sources.length) return;
       const s = document.createElement('div'); s.className = 'sources';
       s.innerHTML = `<div class="meta">Sources</div>` + sources.map((src,i)=>{
+        console.log(src)
         const label = escapeHtml(src.title || src.doc_id || `Source ${i+1}`);
         const href = src.uri || '#';
         return `<div>[${i+1}] <a href="${href}" target="_blank" rel="noopener">${label}</a></div>`;
@@ -379,12 +383,12 @@
 
       const model = 'gpt-5-mini';
       const index = 'schh';
-      const namespace = 'schh_v2';
+      const namespace = 'schh';
       const endpoint = location.hostname === 'localhost' ? '/chat' : 'https://ai-chatbot-fkiv.onrender.com/chat';
       const stream = true;
 
       addMessage('user', renderMD(escapeHtml(text)));
-      const ai = addMessage('ai', renderMD('_…thinking…_'));
+      const ai = addMessage('ai', '<div class="thinking">' + renderMD('_…thinking…_') + '<sl-spinner></sl-spinner></div>');
       const contentEl = ai.querySelector('.content');
       let assistantMsg = '';
 
@@ -475,6 +479,7 @@
       }
     }
 
+    /*
     const sendMessage = async (prompt) => {
 
       prompt = prompt.trim()
@@ -596,6 +601,7 @@
       if (msgCtr > 1) copyButton.style.visibility = 'visible'
       responseMarkdownEl.textContent = response.join('').split('\n').map(line => line.replace(/^#/g, '###')).join('\n')
     }
+    */
 
   </script>
 </body>

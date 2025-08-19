@@ -51,7 +51,7 @@ log = logging.getLogger("schh-rag")
 
 DEFAULT_MODEL      = os.getenv("DEFAULT_MODEL", "gpt-5-mini")
 DEFAULT_INDEX      = os.getenv("DEFAULT_INDEX", "schh")
-DEFAULT_NAMESPACE  = os.getenv("DEFAULT_NAMESPACE", 'schh_v2') 
+DEFAULT_NAMESPACE  = os.getenv("DEFAULT_NAMESPACE", 'schh') 
 EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 ALLOW_ORIGINS = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",")]
@@ -521,8 +521,11 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
     # 7) Build Markdown context + sources
     ctx_parts, sources = [], []
     for i, d in enumerate(top, 1):
-        title = (getattr(d, "metadata", {}) or {}).get("title") or (d.id or "")
-        uri   = (getattr(d, "metadata", {}) or {}).get("source")
+        meta  = getattr(d, "metadata", {}) or {}
+        print(json.dumps(meta, ensure_ascii=False, indent=2))
+        title = ' '.join(meta.get("title") or (d.id or []))
+        uri   = meta.get("source")
+        title = ''.join(meta.get("header_path", [])) or title
         ctx_parts.append(f"### [{i}] {title}\n{getattr(d, 'page_content', '')}")
         base = (d.id or "").rsplit(":", 1)[0]
         if not any(s.get("doc_id")==base for s in sources):
@@ -738,7 +741,7 @@ async def chat_post(request: Request):
     if stream:
         async def gen():
             # initial heartbeat
-            yield sse({"type": "content", "delta": ""})
+            # yield sse({"type": "content", "delta": ""})
             final_text_parts = []
             async for chunk in llm.astream(messages):
                 text = getattr(chunk, "content", None)
