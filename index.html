@@ -22,10 +22,14 @@
     body, sl-drawer::part(title) { font-family: ui-sans-serif, -apple-system, system-ui, Segoe UI, Helvetica, Apple Color Emoji, Arial, sans-serif, Segoe UI Emoji, Segoe UI Symbol; }
     
     .chat-container { position: relative; width: 100%; height: 40%; display: flex; flex-direction: column; overflow: hidden; margin: 0 auto; }
-    .chat-area { flex: 1; padding: 1.5em .5em .5em .5em; overflow-y: scroll; display: flex; flex-direction: column; gap: 12px; }
-    .msg { padding: 10px 14px; border-radius: 8px; line-height: 1.5; }
-    .user { align-self: flex-end; background-color: #ededed; color: #444; }
+    .chat-area { flex: 1; padding: 1em .5em .5em .5em; height: 100%; overflow-y: scroll; display: flex; flex-direction: column; gap: 12px; }
+    
+    .msg { border-radius: 8px; line-height: 1.5; max-width: 90%; }
+    .user { align-self: flex-end; }
+    .user .content { background-color: #ededed; color: #444; padding: .5em 1em; }
+    .user p { margin: 0; }
     .ai { align-self: flex-start; background-color: #fff; color: #444;}
+
     .prompts { display: flex; gap: 0.5em; justify-content: center; padding: 0.5em; width: 100%; margin: auto; }
     .chat-textarea { flex: 1; min-height: 40px; max-height: 150px; overflow-y: auto; }
     .advisory { flex: 1; padding: 0.5em .5em 1em .5em; font-size: 0.8em; text-align: center; }
@@ -68,15 +72,26 @@
     header h1 { font-size: 1.5em; color: #444; flex: 1; text-align: center; margin: .5em; }
 
     .tools { display: flex; gap: 0.5em; opacity: 0; transition: opacity 0.5s; }
+    .msg:hover .tools { opacity: 1; }
     .tools > * { color: #888 }
     .response:d .tools { opacity: 1; }
-    .content { background-color: white; max-width: 80dvw; max-height: 50dvh; overflow: auto; padding: 1em; border: 1px solid #e9ecef; border-radius: 8px; }
+    .content { background-color: inherit; border: 0; }
+    .content p:first-of-type { margin-top: 0; }
+    /* .content p:last-of-type, .content ul:last-of-type { margin-bottom: 0; } */
 
     .sources svg { width: 20px; height: 20px; fill: rgb(136, 136, 136); margin-top: 6px; cursor: pointer; }
     pre { white-space: pre-wrap; word-wrap: break-word; }
     .thinking { display: flex; align-items: center; gap: 0.5em; }
     .thinking p { display: inline; margin: 0; font-style: italic; color: #888; font-size: 0.9em; }
     .meta { margin-top: 0.5em; font-size: 0.8em; color: #888; }
+
+    table { margin-bottom: 30px; width: 100%; text-align: left; color: #3f3f3f; border-collapse: collapse; border: 1px solid #e8e8e8; }
+    table tr:nth-child(even) { background-color: #f7f7f7; }
+    table th, table td { padding: 10px 15px; }
+    table th { background-color: #f0f0f0; border: 1px solid #e0e0e0; }
+    table td { border: 1px solid #e8e8e8;}
+    @media screen and (max-width: 800px) { table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; -ms-overflow-style: -ms-autohiding-scrollbar; } }
+
   </style>
 </head>
 <body>
@@ -334,12 +349,24 @@
         promptsEl.style.display = 'none'
       }
 
-      const div = document.createElement('div');
-      div.className = `msg ${role}`;
-      div.innerHTML = `<div class="content">${html}</div>`;
-      chatEl.appendChild(div);
-      chatEl.scrollTop = chatEl.scrollHeight;
-      return div;
+      const wrapper = document.createElement('div');
+      wrapper.className = `msg ${role}`;
+      const content = document.createElement('div');
+      wrapper.appendChild(content);
+      content.className = 'content';
+      content.setAttribute('id', `md-${msgCtr}`);
+      content.innerHTML = html;
+      const tools = document.createElement('div');
+      tools.className = 'tools';
+      const copyButton = document.createElement('sl-copy-button')
+      copyButton.content = 'testing'
+      copyButton.setAttribute('from', `md-${msgCtr}`)
+      copyButton.setAttribute('tooltip-placement', 'bottom')
+      tools.appendChild(copyButton);
+      wrapper.appendChild(tools);
+      chatEl.appendChild(wrapper);
+      scrollToBottom();
+      return wrapper;
     }
 
     function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -352,7 +379,6 @@
       if (!sources || !sources.length) return;
       const s = document.createElement('div'); s.className = 'sources';
       s.innerHTML = `<div class="meta">Sources</div>` + sources.map((src,i)=>{
-        console.log(src)
         const label = escapeHtml(src.title || src.doc_id || `Source ${i+1}`);
         const href = src.uri || '#';
         return `<div>[${i+1}] <a href="${href}" target="_blank" rel="noopener">${label}</a></div>`;
@@ -416,8 +442,8 @@
           if (obj.type === 'content') {
             assistantMsg += obj.delta || '';
             contentEl.innerHTML = renderMD(assistantMsg);
-            log.scrollTop = log.scrollHeight;
           } else if (obj.type === 'final') {
+            contentEl.style.borderBottom = '1px solid #e0e0e0';
             if (obj.sources?.length) addSources(ai, obj.sources);
             if (!assistantMsg) contentEl.innerHTML = renderMD('_(no content)_');
           } else if (obj.type === 'error') {
@@ -428,6 +454,7 @@
             assistantMsg += obj.content;
             contentEl.innerHTML = renderMD(assistantMsg);
           }
+          scrollToBottom();
         };
 
         while (true){

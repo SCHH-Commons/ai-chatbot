@@ -76,7 +76,7 @@ VOICE_RULES = os.getenv("VOICE_RULES", (
 ))
 STYLE_RULES = os.getenv("STYLE_RULES", (
     "Always format in Markdown with:\n"
-    "- A short **TL;DR** (1–2 lines) at the top.\n"
+    "- A short 1–2 lines summary at the top.\n"
     "- Then **Key points** as bullets (2–6 items).\n"
     "- If procedural, add a **Steps** list.\n"
     "- Use callouts: **Note:**, **Tip:**, **Warning:** as bold labels.\n"
@@ -423,6 +423,7 @@ def get_agent(model: str, index_name: str, namespace: Optional[str]):
         return build_agent(model, index_name, namespace)
 
 def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> Dict[str, Any]:
+    print(f"[retrieve_context] query={query} index={index_name} namespace={namespace}")
     # 1) Encode
     dense_q = embeddings.embed_query(query)
     bm25 = get_bm25()
@@ -439,6 +440,9 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
         namespace=namespace,
     )
     matches = resp.get("matches", []) if isinstance(resp, dict) else getattr(resp, "matches", [])
+    print(len(matches), "matches found")
+    for m in matches:
+        print(json.dumps(m.metadata, indent=2))
 
     # 3) Wrap + group chunks by base doc, cap CHUNKS_PER_DOC
     docs = []
@@ -522,10 +526,9 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
     ctx_parts, sources = [], []
     for i, d in enumerate(top, 1):
         meta  = getattr(d, "metadata", {}) or {}
-        print(json.dumps(meta, ensure_ascii=False, indent=2))
-        title = ' '.join(meta.get("title") or (d.id or []))
+        title = ''.join(meta.get("title").split('-')[-1].replace('.md','').replace('_',' ') or (d.id or []))
         uri   = meta.get("source")
-        title = ''.join(meta.get("header_path", [])) or title
+        # title = ' '.join(meta.get("header_path", [])) or title
         ctx_parts.append(f"### [{i}] {title}\n{getattr(d, 'page_content', '')}")
         base = (d.id or "").rsplit(":", 1)[0]
         if not any(s.get("doc_id")==base for s in sources):
@@ -725,7 +728,7 @@ async def chat_post(request: Request):
         f"# User query\n{prompt}\n\n"
         f"# SCHH/Context Sections\n{context_md}\n"
         f"# Output format\n"
-        f"- Start with **TL;DR** (1–2 lines)\n"
+        f"- Start with 1–2 lines short summary (don't use a shot summary title)\n"
         f"- Then **Key points** (bullets)\n"
         f"- Add **Steps** if procedural\n"
         f"- Use inline citations like [1], [2] where relevant\n"
@@ -835,4 +838,4 @@ if __name__ == "__main__":
     except Exception:
         pass
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run('serve:app', host="0.0.0.0", port=8080, reload=True)
