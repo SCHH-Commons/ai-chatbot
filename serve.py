@@ -3,34 +3,32 @@
 
 """
 Agentic Chat Server (SCHH) — Markdown + SSE + heartbeat + hybrid retrieval + namespaces
-- Hybrid Pinecone query (dense + sparse via BM25 encoder)
-- Markdown-oriented system prompt
-- SSE streaming with initial heartbeat
+- Hybrid Pinecone query (dense + optional sparse via BM25 encoder)
+- Markdown-oriented system prompt & formatting rules
+- SSE streaming with heartbeat, robust token event handling, guaranteed tail
 - Session memory via LangGraph MemorySaver (thread_id=sessionid)
 - Query rewrite, sentence-aware compression, strict LLM rerank
-- Temperature forced to 1
+- OpenAI minis: force temperature=1.0; Anthropic uses FORCED_TEMP
+- Configurable output caps and timeouts
 """
 
-import os, re, json, time, secrets, functools, logging, math
+import os, re, json, time, secrets, functools, logging, math, asyncio
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from threading import RLock
-
 from collections import deque
-from threading import RLock
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.encoders import jsonable_encoder
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_anthropic import ChatAnthropic
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.tools import tool
-from langchain_core.messages.ai import AIMessageChunk
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AIMessageChunk
 
 from pinecone import Pinecone
 from pinecone.core.openapi.shared.exceptions import PineconeApiException
@@ -39,7 +37,7 @@ from pinecone.core.openapi.shared.exceptions import PineconeApiException
 try:
     import joblib
     from pinecone_text.sparse import BM25Encoder
-except Exception:  # keep server running even if package missing
+except Exception:
     joblib = None
     BM25Encoder = None  # type: ignore
 
@@ -51,13 +49,27 @@ log = logging.getLogger("schh-rag")
 
 DEFAULT_MODEL      = os.getenv("DEFAULT_MODEL", "gpt-5-mini")
 DEFAULT_INDEX      = os.getenv("DEFAULT_INDEX", "schh")
-DEFAULT_NAMESPACE  = os.getenv("DEFAULT_NAMESPACE", 'schh') 
+DEFAULT_NAMESPACE  = os.getenv("DEFAULT_NAMESPACE", "schh")
 EMBED_MODEL        = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 ALLOW_ORIGINS = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",")]
-FORCED_TEMP   = 1
-HYBRID_ALPHA  = float(os.getenv("HYBRID_ALPHA", "0.5"))
-BM25_ENCODER_PATH = os.getenv("BM25_ENCODER_PATH", "./bm25_encoder_schh.joblib")
+
+# Temps / caps / timeouts
+FORCED_TEMP        = float(os.getenv("FORCED_TEMP", "0.6"))   # used by Anthropic only
+MAX_OUTPUT_TOKENS  = int(os.getenv("MAX_OUTPUT_TOKENS", "2400"))
+REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "120"))  # seconds
+
+# Retrieval knobs
+HYBRID_ALPHA       = float(os.getenv("HYBRID_ALPHA", "0.5"))
+BM25_ENCODER_PATH  = os.getenv("BM25_ENCODER_PATH", "./bm25_encoder_schh.joblib")
+SPEED_MODE         = os.getenv("SPEED_MODE", "1") == "1"
+RETR_TOP_K         = int(os.getenv("RETR_TOP_K", "30" if SPEED_MODE else "50"))
+DOCS_MAX           = int(os.getenv("DOCS_MAX", "4"  if SPEED_MODE else "6"))
+CHUNKS_PER_DOC     = int(os.getenv("CHUNKS_PER_DOC", "2" if SPEED_MODE else "3"))
+MERGED_MAX_CHARS   = int(os.getenv("MERGED_MAX_CHARS", "2500" if SPEED_MODE else "3500"))
+USE_GAP_EXTRACTOR  = os.getenv("USE_GAP_EXTRACTOR", "0" if SPEED_MODE else "1") == "1"
+SIBS_MAX           = int(os.getenv("SIBS_MAX", "2"))
+MAX_EXTRAS         = int(os.getenv("MAX_EXTRAS", "300"))
 
 SYSTEM_PROMPT = (
     "You are the SCHH community assistant.\n"
@@ -84,76 +96,45 @@ STYLE_RULES = os.getenv("STYLE_RULES", (
     "- Keep line length reasonable; add blank lines between sections.\n"
 ))
 
-SPEED_MODE = os.getenv("SPEED_MODE", "1") == "1"  # default fast
-RETR_TOP_K = int(os.getenv("RETR_TOP_K", "30" if SPEED_MODE else "50"))
-DOCS_MAX   = int(os.getenv("DOCS_MAX", "4"  if SPEED_MODE else "6"))
-CHUNKS_PER_DOC = int(os.getenv("CHUNKS_PER_DOC", "2" if SPEED_MODE else "3"))
-MERGED_MAX_CHARS = int(os.getenv("MERGED_MAX_CHARS", "2500" if SPEED_MODE else "3500"))
-USE_GAP_EXTRACTOR = os.getenv("USE_GAP_EXTRACTOR", "0" if SPEED_MODE else "1") == "1"
-SIBS_MAX = int(os.getenv("SIBS_MAX", "2"))           # siblings per hit
-MAX_EXTRAS = int(os.getenv("MAX_EXTRAS", "300"))     # global cap per request
-
+# Globals
 embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
 pc = Pinecone()
 memory = MemorySaver()
 
-# --- simple in‑process conversation store ---
-SESSIONS: dict[str, deque[dict]] = {}
+# --- in-process conversation store ---
+SESSIONS: Dict[str, deque[dict]] = {}
 SESSIONS_LOCK = RLock()
-MAX_TURNS = 8  # number of prior user/assistant turns to keep per session
+MAX_TURNS = 8
 
 def get_history(sessionid: str) -> deque[dict]:
     with SESSIONS_LOCK:
         if sessionid not in SESSIONS:
-            SESSIONS[sessionid] = deque(maxlen=2*MAX_TURNS)  # each turn ~2 msgs
+            SESSIONS[sessionid] = deque(maxlen=2*MAX_TURNS)
         return SESSIONS[sessionid]
 
 def append_msg(sessionid: str, role: str, content: str) -> None:
     with SESSIONS_LOCK:
         get_history(sessionid).append({"role": role, "content": content})
 
-def build_messages_with_history(sessionid: str, system_prompt: str, current_user_msg: str) -> list[dict]:
-    """
-    Returns: [system] + prior history (user/assistant pairs) + [current user]
-    We only inject the RAG context into *current_user_msg* to avoid polluting history.
-    """
-    msgs = [{"role": "system", "content": system_prompt}]
-    prior = list(get_history(sessionid))
-    # Optionally clamp in case someone changed MAX_TURNS
-    if len(prior) > 2*MAX_TURNS:
-        prior = prior[-2*MAX_TURNS:]
-    msgs.extend(prior)
-    msgs.append({"role": "user", "content": current_user_msg})
-    return msgs
-
 # -----------------------------------------------------------------------------
 # Utils
 # -----------------------------------------------------------------------------
 def sse(data: Dict[str, Any]) -> str:
-    """Encode an SSE event with a JSON payload."""
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 @functools.lru_cache(maxsize=2048)
 def get_text_cached(chunk_id: str, index_name: str, namespace: Optional[str]) -> Optional[str]:
-    """Fetch a chunk's raw text from Pinecone by id (namespace-aware)."""
     try:
         idx = pc.Index(index_name)
-        res = idx.query(
-            id=chunk_id,
-            top_k=1,
-            include_values=False,
-            include_metadata=True,
-            namespace=namespace
-        )
-        matches = res.get("matches", []) if isinstance(res, dict) else getattr(res, "matches", [])
-        if matches:
-            md = matches[0].get("metadata") if isinstance(matches[0], dict) else getattr(matches[0], "metadata", {})
-            return (md or {}).get("text")
+        res = idx.fetch(ids=[chunk_id], namespace=namespace)
+        vectors = (res or {}).get("vectors", {}) or {}
+        v = vectors.get(chunk_id) or {}
+        md = v.get("metadata") or {}
+        return md.get("text")
     except Exception as e:
         log.warning(f"get_text_cached({chunk_id}) error: {e}")
     return None
 
-# --- sentence-aware utilities ---
 _SENT_RE = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9])')
 
 def split_sentences(text: str) -> List[str]:
@@ -178,7 +159,6 @@ def split_sentences(text: str) -> List[str]:
     return [s for s in out if s.strip()]
 
 def sentaware_compress(texts: List[str], max_chars: int = 3500) -> str:
-    """Sentence-aware dedupe + trim. Preserves code fences & bullets better than flat whitespace trim."""
     seen = set(); out = []; total = 0
     for t in texts:
         if "```" in (t or ""):
@@ -196,11 +176,45 @@ def sentaware_compress(texts: List[str], max_chars: int = 3500) -> str:
     return "\n".join(out)
 
 def tokenish_overlap(a: str, b: str) -> float:
-    """Cheap lexical overlap (proxy for MMR diversity & scoring)."""
     A = set(re.findall(r"[A-Za-z0-9]{3,}", a.lower()))
     B = set(re.findall(r"[A-Za-z0-9]{3,}", b.lower()))
     if not A or not B: return 0.0
     return len(A & B) / math.sqrt(len(A) * len(B))
+
+# Text extraction helpers (for non-stream path robustness)
+def _to_text(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    content = getattr(x, "content", None)
+    if isinstance(content, list):
+        return "".join(seg.get("text", "") for seg in content if isinstance(seg, dict))
+    if isinstance(content, str):
+        return content
+    if isinstance(x, dict):
+        for k in ("content", "text", "output", "answer"):
+            v = x.get(k)
+            if isinstance(v, str):
+                return v
+            if hasattr(v, "content"):
+                return getattr(v, "content", "") or ""
+    return ""
+
+def _extract_answer_from_result(res) -> str:
+    if res is None:
+        return ""
+    if isinstance(res, dict):
+        msgs = res.get("messages")
+        if isinstance(msgs, list) and msgs:
+            return _to_text(msgs[-1]) or ""
+        out = res.get("output") or res.get("response") or res.get("final") or res.get("answer")
+        if out:
+            return _to_text(out)
+        return ""
+    if isinstance(res, list) and res:
+        return _to_text(res[-1]) or ""
+    return _to_text(res)
 
 # Hybrid encoder (lazy load)
 _bm25: Optional["BM25Encoder"] = None  # type: ignore
@@ -222,214 +236,68 @@ def get_bm25():
         return None
 
 def fetch_texts_batch(index_name: str, namespace: Optional[str], ids: list[str]) -> dict[str, str]:
-    """Fetch metadata.text for ids using small batches; degrade gracefully on errors."""
     out: dict[str, str] = {}
     if not ids:
         return out
     idx = pc.Index(index_name)
-
-    # conservative batch size: 100 ids to avoid URL bloat (fetch is GET under the hood)
     batch = 100
     i = 0
     while i < len(ids):
         subset = ids[i:i+batch]
         try:
             res = idx.fetch(ids=subset, namespace=namespace)
-            vectors = (res or {}).get("vectors", {}) if isinstance(res, dict) else getattr(res, "vectors", {})
-            for vid, v in (vectors or {}).items():
-                md = v.get("metadata") if isinstance(v, dict) else getattr(v, "metadata", {}) or {}
-                txt = (md or {}).get("text")
+            vectors = (res or {}).get("vectors", {}) or {}
+            for vid, v in vectors.items():
+                md = v.get("metadata") or {}
+                txt = md.get("text")
                 if txt:
                     out[vid] = txt
             i += batch
-        except PineconeApiException as e:
-            # If we hit 414 or similar, halve the batch and retry; if too small, give up gracefully
-            if getattr(e, "status", None) == 414 and batch > 10:
+        except PineconeApiException:
+            if batch > 10:
                 batch //= 2
                 continue
-            # Non-recoverable or still failing with tiny batches — return what we have
             break
         except Exception:
-            # Don’t fail the whole request if fetch struggles; just return partials
             break
     return out
 
 # -----------------------------------------------------------------------------
-# Agent builder (cached per (model,index,namespace))
+# LLM factory (OpenAI temp=1.0; Anthropic uses FORCED_TEMP)
 # -----------------------------------------------------------------------------
-_build_lock = RLock()
-
-@functools.lru_cache(maxsize=24)
-def build_agent(model: str, index_name: str, namespace: Optional[str]):
-    log.info(f"[build_agent] model={model} index={index_name} ns={namespace}")
-
-    # Main LLM
-    if model.startswith(("gpt-", "o")):
-        llm = ChatOpenAI(model=model, temperature=FORCED_TEMP, max_tokens=600)  # tune 400–800
-
-    else:
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            raise RuntimeError("ANTHROPIC_API_KEY not set but Anthropic model requested")
-        llm = ChatAnthropic(model_name=model)  # Anthropic path
-
-    # ----- Tools -----
-    @tool
-    def current_date() -> str:
-        """Use this to get the current date (YYYY-MM-DD)."""
-        return datetime.today().strftime("%Y-%m-%d")
-
-    @tool
-    def schh_weather() -> str:
-        """Get a short weather summary for the Sun City Hilton Head region (best-effort)."""
-        try:
-            from langchain_community.tools.tavily_search import TavilySearchResults
-            tv = TavilySearchResults(max_results=3, search_depth="advanced", include_answer=True)
-            res = tv.invoke({"query": "Weather forecast Sun City Hilton Head SC"})
-            return json.dumps(res, ensure_ascii=False)[:4000]
-        except Exception as e:
-            return f"Weather lookup failed: {e}"
-
-    # Lightweight query rewriter (same main LLM; temp=1 deterministic)
-    @tool
-    def rewrite_query(q: str) -> str:
-        """Rewrite/expand a user query with synonyms/variants/abbreviations for retrieval. Keep it under 30 words."""
-        try:
-            prompt = (
-                "Rewrite this for retrieval: add synonyms, expand abbreviations, and include likely variants. "
-                "Return one line, <30 words, no explanations.\n\nQuery: " + q
-            )
-            resp = llm.invoke(prompt)
-            return getattr(resp, "content", "")[:400]
-        except Exception:
-            return q
-
-    @tool(response_format="content_and_artifact")
-    def retrieve(query: str):
-        """
-        Hybrid Pinecone retrieval:
-          - dense embed of query
-          - sparse BM25 vector of query (if encoder available)
-          - single Pinecone query with alpha blend (namespace-aware)
-          - group by base doc id → cap chunks per doc
-          - sentence-aware compression
-          - strict LLM rerank (indices only) to top N docs
-        Returns serialized text for the LLM + artifacts for sources.
-        """
-        # 1) Encode query (dense + optional sparse)
-        dense_q = embeddings.embed_query(query)
-        bm25 = get_bm25()
-        sparse_q = bm25.encode_queries([query])[0] if bm25 else None
-
-        # 2) Hybrid query to Pinecone (single round trip)
-        pine = pc.Index(index_name)
-        try:
-            resp = pine.query(
-                vector=dense_q,
-                sparse_vector=sparse_q,   # None → dense-only
-                top_k=50,
-                include_metadata=True,
-                alpha=HYBRID_ALPHA,
-                namespace=namespace,
-            )
-            matches = resp.get("matches", []) if isinstance(resp, dict) else getattr(resp, "matches", [])
-        except Exception as e:
-            log.warning(f"[retrieve] pinecone query failed: {e}")
-            return "", []
-
-        # 3) Wrap matches into light doc objects
-        docs = []
-        for m in matches or []:
-            mid = m.get("id") if isinstance(m, dict) else getattr(m, "id", "")
-            mmeta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", {}) or {}
-            content = (mmeta or {}).get("text", "")
-            d = type("Doc", (), {})()
-            d.id = mid
-            d.metadata = mmeta or {}
-            d.page_content = content
-            docs.append(d)
-
-        # 4) Group by base doc id; keep up to 3 chunks/doc
-        by_doc: Dict[str, List] = {}
-        for d in docs:
-            base_id = (d.id or "").rsplit(":", 1)[0]
-            if not base_id:
-                continue
-            by_doc.setdefault(base_id, [])
-            if len(by_doc[base_id]) < 3:
-                by_doc[base_id].append(d)
-
-        # 5) Merge + sentence-aware compression (add parent/siblings where available)
-        merged_docs = []
-        for base_id, chunks in by_doc.items():
-            texts = []
-            for doc in chunks:
-                if getattr(doc, "page_content", None):
-                    texts.append(doc.page_content)
-                meta = getattr(doc, "metadata", {}) or {}
-                parent_id = meta.get("parent_id")
-                if parent_id:
-                    t = get_text_cached(parent_id, index_name, namespace)
-                    if t:
-                        texts.append(t)
-                for sib_id in meta.get("sib_ids", []) or []:
-                    t = get_text_cached(sib_id, index_name, namespace)
-                    if t:
-                        texts.append(t)
-            merged = sentaware_compress(texts, max_chars=3500)
-            if chunks:
-                d0 = chunks[0]
-                d0.page_content = merged
-                merged_docs.append(d0)
-
-        if not merged_docs:
-            return "", []
-
-        # 6) Strict LLM rerank to top N (indices only)
-        def _llm_rerank(q: str, docs: List, top_k: int = 6) -> List:
-            try:
-                items = []
-                for i, d in enumerate(docs[:30]):
-                    title = (getattr(d, "metadata", {}) or {}).get("title") or (d.id or "")[:80]
-                    snippet = (getattr(d, "page_content", "") or "")[:800]
-                    items.append(f"[{i}] {title}\n{snippet}")
-                prompt = (
-                    "Rank these passages by relevance to the query. Return a JSON array of indices only.\n\n"
-                    f"Query: {q}\n\nPassages:\n" + "\n\n".join(items) + "\n\nIndices:"
-                )
-                resp = llm.invoke(prompt)  # reuse main llm (temp=1)
-                idx = json.loads(getattr(resp, "content", "[]"))
-                ranked = [docs[i] for i in idx if isinstance(i, int) and 0 <= i < len(docs)]
-                return ranked[:top_k] if ranked else docs[:top_k]
-            except Exception:
-                return docs[:6]
-
-        ranked = _llm_rerank(query, merged_docs, top_k=6)
-
-        # 7) Serialize for the agent; keep artifacts for sources
-        serialized = "\n||\n".join(
-            f"Source: {json.dumps(getattr(d, 'metadata', {}) or {})}\n"
-            f"Content: {getattr(d, 'page_content', '')}"
-            for d in ranked
+def make_llm(model: str, max_tokens: Optional[int] = None):
+    mt = max_tokens or MAX_OUTPUT_TOKENS
+    if model.startswith(("gpt-", "o")):  # OpenAI family
+        log.info(f"[make_llm] OpenAI model={model} -> temperature=1.0, streaming=True, max_tokens={mt}")
+        return ChatOpenAI(
+            model=model,
+            temperature=1.0,
+            streaming=True,
+            max_tokens=mt,
+            timeout=REQUEST_TIMEOUT,
+            max_retries=2,
         )
-        return serialized, ranked
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise RuntimeError("ANTHROPIC_API_KEY not set but Anthropic model requested")
+    log.info(f"[make_llm] Anthropic model={model} -> temperature={FORCED_TEMP}, streaming=True, max_tokens={mt}")
+    return ChatAnthropic(
+        model_name=model,
+        temperature=FORCED_TEMP,
+        streaming=True,
+        max_tokens=mt,
+        timeout=REQUEST_TIMEOUT,
+        max_retries=2,
+    )
 
-    tools = [current_date, schh_weather, rewrite_query, retrieve]
-    agent = create_react_agent(llm.bind(temperature=FORCED_TEMP), tools, checkpointer=memory)
-    log.info(f"[build_agent] constructed llm model={model} temp={FORCED_TEMP}")
-    return agent
-
-def get_agent(model: str, index_name: str, namespace: Optional[str]):
-    with _build_lock:
-        return build_agent(model, index_name, namespace)
-
+# -----------------------------------------------------------------------------
+# Retrieval pipeline (server-side authoritative)
+# -----------------------------------------------------------------------------
 def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> Dict[str, Any]:
-    print(f"[retrieve_context] query={query} index={index_name} namespace={namespace}")
-    # 1) Encode
+    log.info(f"[retrieve_context] q={query!r} index={index_name} ns={namespace}")
     dense_q = embeddings.embed_query(query)
     bm25 = get_bm25()
     sparse_q = bm25.encode_queries([query])[0] if bm25 else None
 
-    # 2) Hybrid query
     pine = pc.Index(index_name)
     resp = pine.query(
         vector=dense_q,
@@ -440,11 +308,7 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
         namespace=namespace,
     )
     matches = resp.get("matches", []) if isinstance(resp, dict) else getattr(resp, "matches", [])
-    print(len(matches), "matches found")
-    for m in matches:
-        print(json.dumps(m.metadata, indent=2))
 
-    # 3) Wrap + group chunks by base doc, cap CHUNKS_PER_DOC
     docs = []
     for m in matches or []:
         mid = m.get("id") if isinstance(m, dict) else getattr(m, "id", "")
@@ -463,7 +327,6 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
         if len(by_doc[base_id]) < CHUNKS_PER_DOC:
             by_doc[base_id].append(d)
 
-    # 4) Batch collect parent/sibling ids (LIMITED)
     need_ids = []
     for chunks in by_doc.values():
         for doc in chunks:
@@ -473,18 +336,15 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
                 need_ids.append(pid)
             sibs = md.get("sib_ids", []) or []
             if SIBS_MAX > 0 and sibs:
-                need_ids.extend(sibs[:SIBS_MAX])  # only take a few
-    # de-dupe and cap
+                need_ids.extend(sibs[:SIBS_MAX])
     need_ids = list(dict.fromkeys(need_ids))[:MAX_EXTRAS]
-    
     try:
         extras = fetch_texts_batch(index_name, namespace, need_ids)
     except Exception:
         extras = {}
 
-    # 5) Merge + sentence-aware compress
     merged_docs = []
-    for base_id, chunks in by_doc.items():
+    for _, chunks in by_doc.items():
         texts = []
         for doc in chunks:
             if getattr(doc, "page_content", None):
@@ -505,11 +365,9 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
     if not merged_docs:
         return {"context_md": "", "sources": []}
 
-    # 6) MMR‑lite doc selection (no LLM re‑rank)
+    # MMR-lite selection
     selected = []
-    seen = set()
     for d in merged_docs:
-        # Favor diversity by skipping near-duplicates
         keep = True
         for s in selected:
             if tokenish_overlap(d.page_content, s.page_content) > 0.7:
@@ -519,17 +377,17 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
             selected.append(d)
         if len(selected) >= DOCS_MAX:
             break
-
     top = selected or merged_docs[:DOCS_MAX]
 
-    # 7) Build Markdown context + sources
+    # Build Markdown context + sources
     ctx_parts, sources = [], []
     for i, d in enumerate(top, 1):
         meta  = getattr(d, "metadata", {}) or {}
-        title = ''.join(meta.get("title").split('-')[-1].replace('.md','').replace('_',' ') or (d.id or []))
+        raw_title = (meta.get("title") or d.id or "")
+        cleaned   = raw_title.split("-")[-1].replace(".md","").replace("_"," ")
+        title     = (cleaned.strip() or raw_title)
         uri   = meta.get("source")
-        # title = ' '.join(meta.get("header_path", [])) or title
-        ctx_parts.append(f"### [{i}] {title}\n{getattr(d, 'page_content', '')}")
+        ctx_parts.append(f"### [{i}] {getattr(d, 'page_content', '')}")
         base = (d.id or "").rsplit(":", 1)[0]
         if not any(s.get("doc_id")==base for s in sources):
             sources.append({"doc_id": base, "title": title, "uri": uri})
@@ -537,7 +395,365 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
     return {"context_md": context_md, "sources": sources}
 
 # -----------------------------------------------------------------------------
-# FastAPI app
+# Agent builder (cached per (model,index,namespace,include_retrieve,max_tokens))
+# -----------------------------------------------------------------------------
+_build_lock = RLock()
+
+@functools.lru_cache(maxsize=32)
+def build_agent(model: str, index_name: str, namespace: Optional[str],
+                include_retrieve: bool, max_tokens: int):
+    log.info(f"[build_agent] model={model} index={index_name} ns={namespace} include_retrieve={include_retrieve} max_tokens={max_tokens}")
+    llm = make_llm(model, max_tokens=max_tokens)
+
+    @tool
+    def current_date() -> str:
+        """Get current date (YYYY-MM-DD)."""
+        return datetime.today().strftime("%Y-%m-%d")
+
+    @tool
+    def schh_weather() -> str:
+        """Best-effort weather for Sun City Hilton Head."""
+        try:
+            from langchain_community.tools.tavily_search import TavilySearchResults
+            tv = TavilySearchResults(max_results=3, search_depth="advanced", include_answer=True)
+            res = tv.invoke({"query": "Weather forecast Sun City Hilton Head SC"})
+            return json.dumps(res, ensure_ascii=False)[:4000]
+        except Exception as e:
+            return f"Weather lookup failed: {e}"
+
+    @tool
+    def rewrite_query(q: str) -> str:
+        """Rewrite/expand a user query for retrieval; <30 words, one line."""
+        try:
+            prompt = (
+                "Rewrite this for retrieval: add synonyms, expand abbreviations, and include likely variants. "
+                "Return one line, <30 words, no explanations.\n\nQuery: " + q
+            )
+            resp = llm.invoke(prompt)
+            return getattr(resp, "content", "")[:400]
+        except Exception:
+            return q
+
+    tools = [current_date, schh_weather, rewrite_query]
+
+    if include_retrieve:
+        @tool(response_format="content_and_artifact")
+        def retrieve(query: str):
+            """Hybrid Pinecone retrieval (agent tool variant)."""
+            dense_q = embeddings.embed_query(query)
+            bm25 = get_bm25()
+            sparse_q = bm25.encode_queries([query])[0] if bm25 else None
+
+            pine = pc.Index(index_name)
+            try:
+                resp = pine.query(
+                    vector=dense_q,
+                    sparse_vector=sparse_q,
+                    top_k=50,
+                    include_metadata=True,
+                    alpha=HYBRID_ALPHA,
+                    namespace=namespace,
+                )
+                matches = resp.get("matches", []) if isinstance(resp, dict) else getattr(resp, "matches", [])
+            except Exception as e:
+                log.warning(f"[retrieve] pinecone query failed: {e}")
+                return "", []
+
+            docs = []
+            for m in matches or []:
+                mid = m.get("id") if isinstance(m, dict) else getattr(m, "id", "")
+                mmeta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", {}) or {}
+                content = (mmeta or {}).get("text", "")
+                d = type("Doc", (), {})()
+                d.id = mid
+                d.metadata = mmeta or {}
+                d.page_content = content
+                docs.append(d)
+
+            by_doc: Dict[str, List] = {}
+            for d in docs:
+                base_id = (d.id or "").rsplit(":", 1)[0]
+                if not base_id: continue
+                by_doc.setdefault(base_id, [])
+                if len(by_doc[base_id]) < 3:
+                    by_doc[base_id].append(d)
+
+            merged_docs = []
+            for _, chunks in by_doc.items():
+                texts = []
+                for doc in chunks:
+                    if getattr(doc, "page_content", None):
+                        texts.append(doc.page_content)
+                    meta = getattr(doc, "metadata", {}) or {}
+                    parent_id = meta.get("parent_id")
+                    if parent_id:
+                        t = get_text_cached(parent_id, index_name, namespace)
+                        if t: texts.append(t)
+                    for sib_id in meta.get("sib_ids", []) or []:
+                        t = get_text_cached(sib_id, index_name, namespace)
+                        if t: texts.append(t)
+                merged = sentaware_compress(texts, max_chars=3500)
+                if chunks:
+                    d0 = chunks[0]
+                    d0.page_content = merged
+                    merged_docs.append(d0)
+
+            if not merged_docs:
+                return "", []
+
+            def _llm_rerank(q: str, docs: List, top_k: int = 6) -> List:
+                try:
+                    items = []
+                    for i, d in enumerate(docs[:30]):
+                        title = (getattr(d, "metadata", {}) or {}).get("title") or (d.id or "")[:80]
+                        snippet = (getattr(d, "page_content", "") or "")[:800]
+                        items.append(f"[{i}] {title}\n{snippet}")
+                    prompt = (
+                        "Rank these passages by relevance to the query. Return a JSON array of indices only.\n\n"
+                        f"Query: {q}\n\nPassages:\n" + "\n\n".join(items) + "\n\nIndices:"
+                    )
+                    resp = llm.invoke(prompt)
+                    idx = json.loads(getattr(resp, "content", "[]"))
+                    ranked = [docs[i] for i in idx if isinstance(i, int) and 0 <= i < len(docs)]
+                    return ranked[:top_k] if ranked else docs[:top_k]
+                except Exception:
+                    return docs[:6]
+
+            ranked = _llm_rerank(query, merged_docs, top_k=6)
+            serialized = "\n||\n".join(
+                f"Source: {json.dumps(getattr(d, 'metadata', {}) or {})}\n"
+                f"Content: {getattr(d, 'page_content', '')}"
+                for d in ranked
+            )
+            return serialized, ranked
+
+        tools.append(retrieve)
+
+    agent = create_react_agent(llm, tools, checkpointer=memory)
+    log.info(f"[build_agent] constructed llm model={model} (OpenAI temp=1.0; Anthropic temp={FORCED_TEMP})")
+    return agent
+
+def get_agent(model: str, index_name: str, namespace: Optional[str],
+              include_retrieve: bool, max_tokens: int):
+    with _build_lock:
+        return build_agent(model, index_name, namespace, include_retrieve, max_tokens)
+
+# -----------------------------------------------------------------------------
+# Message builders (BaseMessage objects)
+# -----------------------------------------------------------------------------
+def build_messages(user_prompt: str):
+    return [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=user_prompt)]
+
+def build_messages_with_history(sessionid: str, system_prompt: str, current_user_msg: str):
+    msgs = [SystemMessage(content=system_prompt)]
+    prior = list(get_history(sessionid))
+    if len(prior) > 2 * MAX_TURNS:
+        prior = prior[-2 * MAX_TURNS:]
+    for m in prior:
+        role = m.get("role"); content = m.get("content", "")
+        if role == "user":
+            msgs.append(HumanMessage(content=content))
+        elif role == "assistant":
+            msgs.append(AIMessage(content=content))
+    msgs.append(HumanMessage(content=current_user_msg))
+    return msgs
+
+# -----------------------------------------------------------------------------
+# Streaming (event-level + fallbacks, guaranteed tail)
+# -----------------------------------------------------------------------------
+async def stream_response(agent,
+                          messages,
+                          config,
+                          base_sources: Optional[List[Dict[str, Any]]] = None,
+                          sessionid: Optional[str] = None,
+                          model: Optional[str] = None):
+    sources: List[Dict[str, Any]] = list(base_sources or [])
+    final_text_parts: List[str] = []
+    yielded_any = False
+
+    # heartbeat
+    yield sse({"type": "content", "delta": ""})
+
+    # Primary: event-level streaming
+    try:
+        async for ev in agent.astream_events({"messages": messages}, config):
+            et = ev.get("event"); data = ev.get("data") or {}
+
+            if et == "on_chat_model_stream":
+                chunk = data.get("chunk")
+                delta = getattr(chunk, "content", "") if chunk else ""
+                if isinstance(delta, list):
+                    delta = "".join(seg.get("text", "") for seg in delta if isinstance(seg, dict))
+                if delta:
+                    yielded_any = True
+                    final_text_parts.append(delta)
+                    yield sse({"type": "content", "delta": delta})
+
+            elif et == "on_llm_stream":
+                chunk = data.get("chunk")
+                delta = getattr(chunk, "content", "") if hasattr(chunk, "content") else (chunk or "")
+                if isinstance(delta, list):
+                    delta = "".join(seg.get("text", "") for seg in delta if isinstance(seg, dict))
+                if delta:
+                    yielded_any = True
+                    final_text_parts.append(delta)
+                    yield sse({"type": "content", "delta": delta})
+
+            elif et in ("on_chat_model_end", "on_chain_end"):
+                text_candidates: List[str] = []
+                gens = data.get("generations")
+                if gens and isinstance(gens, list):
+                    for g in gens:
+                        seq = g if isinstance(g, list) else [g]
+                        for gg in seq:
+                            if isinstance(gg, dict):
+                                if gg.get("text"):
+                                    text_candidates.append(gg["text"])
+                                elif "message" in gg and getattr(gg["message"], "content", ""):
+                                    text_candidates.append(gg["message"].content)
+                out = data.get("output") or data.get("response")
+                if hasattr(out, "content"):
+                    text_candidates.append(getattr(out, "content", "") or "")
+                elif isinstance(out, dict):
+                    for k in ("content", "output", "text"):
+                        if out.get(k):
+                            text_candidates.append(str(out[k]))
+                final_tail = "".join(tc for tc in text_candidates if tc)
+                if final_tail:
+                    yielded_any = True
+                    final_text_parts.append(final_tail)
+                    yield sse({"type": "content", "delta": final_tail})
+
+            elif et == "on_tool_end":
+                output = data.get("output") or ""
+                try:
+                    docs = str(output).split("\n||\n")
+                    meta_strs = [re.sub(r"^Source:\s*", "", d.split("\n")[0]) for d in docs if d.strip()]
+                    for m in meta_strs:
+                        rec = json.loads(m)
+                        src_id = (rec.get("id") or "").rsplit(":", 1)[0]
+                        if src_id and not any(s.get("doc_id") == src_id for s in sources):
+                            sources.append({
+                                "doc_id": src_id,
+                                "title": rec.get("title") or src_id,
+                                "uri":   rec.get("source"),
+                                "chunk": rec.get("chunk_id")
+                            })
+                except Exception:
+                    pass
+    except Exception as e:
+        yield sse({"type": "error", "message": str(e)})
+
+    # Fallback 1: message-level streaming
+    if not yielded_any:
+        try:
+            async for msg, meta in agent.astream({"messages": messages}, config, stream_mode="messages"):
+                if isinstance(msg, AIMessageChunk):
+                    delta = msg.content if isinstance(msg.content, str) else "".join(
+                        seg.get("text", "") for seg in (msg.content or []) if isinstance(seg, dict)
+                    )
+                    if delta:
+                        yielded_any = True
+                        final_text_parts.append(delta)
+                        yield sse({"type": "content", "delta": delta})
+        except Exception:
+            pass
+
+    # Fallback 2: raw LLM streaming (bypass agent)
+    if not yielded_any and model:
+        try:
+            raw_llm = make_llm(model, max_tokens=MAX_OUTPUT_TOKENS)
+            async for chunk in raw_llm.astream(messages):
+                text = getattr(chunk, "content", "")
+                if isinstance(text, list):
+                    text = "".join(seg.get("text", "") for seg in text if isinstance(seg, dict))
+                if text:
+                    yielded_any = True
+                    final_text_parts.append(text)
+                    yield sse({"type": "content", "delta": text})
+        except Exception:
+            pass
+
+    # Fallback 3: one-shot invoke
+    if not yielded_any:
+        try:
+            res = agent.invoke({"messages": messages}, config)
+            text = _extract_answer_from_result(res)
+            if text:
+                final_text_parts.append(text)
+                yield sse({"type": "content", "delta": text})
+        except Exception as e:
+            yield sse({"type": "error", "message": str(e)})
+
+    # persist
+    if sessionid:
+        try:
+            append_msg(sessionid, "assistant", "".join(final_text_parts))
+        except Exception:
+            pass
+
+    yield sse({"type": "final", "sources": sources})
+
+# -----------------------------------------------------------------------------
+# Non-stream response (robust extraction + fallback)
+# -----------------------------------------------------------------------------
+def non_stream_response(agent, messages, config, model: str, index: str, namespace: Optional[str],
+                        base_sources: Optional[List[Dict[str, Any]]] = None) -> JSONResponse:
+    t0 = time.time()
+    try:
+        result = agent.invoke({"messages": messages}, config)
+    except Exception as e:
+        log.warning(f"[non_stream] agent.invoke failed: {e}; falling back to raw LLM")
+        raw = make_llm(model)
+        result = raw.invoke(messages)
+
+    answer = _extract_answer_from_result(result)
+
+    if not answer.strip():
+        log.info("[non_stream] empty answer from agent; falling back to raw LLM invoke")
+        raw = make_llm(model)
+        try:
+            raw_res = raw.invoke(messages)
+            answer = _to_text(raw_res) or answer
+        except Exception as e:
+            log.warning(f"[non_stream] raw LLM invoke failed: {e}")
+
+    latency = int((time.time() - t0) * 1000)
+
+    # merge sources (precomputed + any tool-derived)
+    sources: List[Dict[str, Any]] = list(base_sources or [])
+    try:
+        inter = result.get("messages", []) if isinstance(result, dict) else []
+        for m in inter:
+            docs = (_to_text(m) or "").split("\n||\n")
+            meta_strs = [re.sub(r"^Source:\s*", "", d.split("\n")[0]) for d in docs if d.strip()]
+            for ms in meta_strs:
+                try:
+                    rec = json.loads(ms)
+                    src_id = (rec.get("id") or "").rsplit(":", 1)[0]
+                    if src_id and not any(s.get("doc_id") == src_id for s in sources):
+                        sources.append({
+                            "doc_id": src_id,
+                            "title": rec.get("title") or src_id,
+                            "uri":   rec.get("source"),
+                            "chunk": rec.get("chunk_id")
+                        })
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "answer": answer or "",
+        "sources": sources,
+        "model": model,
+        "index": index,
+        "namespace": namespace,
+        "latency_ms": latency
+    })
+
+# -----------------------------------------------------------------------------
+# FastAPI app and routes
 # -----------------------------------------------------------------------------
 app = FastAPI()
 
@@ -568,224 +784,23 @@ async def root():
 def healthz():
     return {"ok": True}
 
-# -----------------------------------------------------------------------------
-# Chat logic
-# -----------------------------------------------------------------------------
-def build_messages(user_prompt: str) -> List[Dict[str, str]]:
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": user_prompt},
-    ]
+# SSE test to isolate proxy/buffering issues
+@app.get("/sse_test")
+async def sse_test():
+    async def gen():
+        for _ in range(1000):  # ~500KB total
+            yield sse({"type":"content","delta":"."*500})
+            await asyncio.sleep(0.005)
+        yield sse({"type":"final","sources":[]})
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(gen(), headers=headers)
 
-async def stream_response(agent, messages, config):
-    """SSE stream: yields a heartbeat first, then incremental content, then final sources."""
-    sources: List[Dict[str, Any]] = []
-    # Heartbeat so the client shows activity immediately
-    yield sse({"type": "content", "delta": ""})
-
-    try:
-        async for msg, meta in agent.astream({"messages": messages}, config, stream_mode="messages"):
-            if msg.content:
-                if meta.get("langgraph_node") == "agent":
-                    if isinstance(msg, AIMessageChunk):
-                        if isinstance(msg.content, str):
-                            delta = msg.content
-                        else:
-                            # LC can emit list chunks
-                            delta = "".join([rec.get("text", "") for rec in msg.content if isinstance(rec, dict)])
-                        if delta:
-                            yield sse({"type": "content", "delta": delta})
-                else:
-                    # Tool outputs; try to collect source metadata if present
-                    try:
-                        docs = (msg.content or "").split("\n||\n")
-                        meta_strs = [re.sub(r"^Source:\s*", "", d.split("\n")[0]) for d in docs if d.strip()]
-                        for m in meta_strs:
-                            rec = json.loads(m)
-                            src = {k: v for k, v in rec.items() if k in ("id", "title", "source", "chunk_id")}
-                            if "id" in src:
-                                src_id = src["id"].rsplit(":", 1)[0]
-                                src["id"] = src_id
-                                if not any(s.get("doc_id") == src_id for s in sources):
-                                    sources.append({
-                                        "doc_id": src_id,
-                                        "title": src.get("title") or src_id,
-                                        "uri":   src.get("source"),
-                                        "chunk": src.get("chunk_id")
-                                    })
-                    except Exception as e:
-                        log.debug(f"source parse error: {e}")
-    except Exception as e:
-        yield sse({"type": "error", "message": str(e)})
-    # Finalize with sources
-    yield sse({"type": "final", "sources": sources})
-
-def non_stream_response(agent, messages, config, model: str, index: str, namespace: Optional[str]) -> JSONResponse:
-    t0 = time.time()
-    result = agent.invoke({"messages": messages}, config)
-    latency = int((time.time() - t0) * 1000)
-    answer = result["messages"][-1].content if isinstance(result, dict) else ""
-
-    # Best-effort source extraction (same logic as stream)
-    sources: List[Dict[str, Any]] = []
-    inter = result.get("messages", []) if isinstance(result, dict) else []
-    for m in inter:
-        try:
-            docs = (getattr(m, "content", "") or "").split("\n||\n")
-            meta_strs = [re.sub(r"^Source:\s*", "", d.split("\n")[0]) for d in docs if d.strip()]
-            for ms in meta_strs:
-                rec = json.loads(ms)
-                src_id = (rec.get("id") or "").rsplit(":", 1)[0]
-                if src_id and not any(s.get("doc_id") == src_id for s in sources):
-                    sources.append({
-                        "doc_id": src_id,
-                        "title": rec.get("title") or src_id,
-                        "uri":   rec.get("source"),
-                        "chunk": rec.get("chunk_id")
-                    })
-        except Exception:
-            pass
-
-    return JSONResponse({
-        "answer": answer,
-        "sources": sources,
-        "model": model,
-        "index": index,
-        "namespace": namespace,
-        "latency_ms": latency
-    })
-
-def extract_gaps_for_general(prompt: str, context_md: str, llm, max_chars: int = 2500) -> list[str]:
-    """Ask the LLM to list missing needs so general guidance can target gaps."""
-    gap_prompt = (
-        "List 3–6 short items the answer would need that are NOT present in the provided context. "
-        "Return a JSON array of short noun-phrases or questions. Do not repeat items covered by the context.\n\n"
-        f"User query:\n{prompt}\n\nContext (truncated):\n{context_md[:max_chars]}"
-    )
-    try:
-        resp = llm.invoke([{"role":"user","content":gap_prompt}])
-        items = json.loads(getattr(resp, "content", "[]"))
-        if isinstance(items, list):
-            return [str(x)[:120] for x in items][:6]
-    except Exception:
-        pass
-    return []
-
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
-@app.post("/chat")
-@app.post("/chat/")
-async def chat_post(request: Request):
-    payload   = await request.json()
-    prompt    = payload.get("prompt", "")
-    model     = payload.get("model", DEFAULT_MODEL)
-    index     = payload.get("index", DEFAULT_INDEX)
-    namespace = payload.get("namespace", DEFAULT_NAMESPACE)
-    stream    = bool(payload.get("stream", False))
-    sessionid = payload.get("sessionid", secrets.token_hex(4))
-
-    # 1) Force retrieval first
-    ctx = retrieve_context(prompt, index, namespace)
-    context_md, sources = ctx["context_md"], ctx["sources"]
-
-    # 2) Choose LLM
-    if model.startswith(("gpt-", "o")):
-        llm = ChatOpenAI(model=model, temperature=1)
-    else:
-        llm = ChatAnthropic(model_name=model)
-
-    # 3) Optional: gap targeting for (General) items
-    gaps = extract_gaps_for_general(prompt, context_md, llm) if (context_md and USE_GAP_EXTRACTOR) else []
-    
-    answering_rules = """
-    # Answering Rules (Blend Mode)
-    1) The SCHH/context is the source of truth for local rules, procedures, contacts, and exceptions.
-    2) You MAY add general best-practice/background items only to fill gaps. Prefix each such line with "(General)".
-    3) If general guidance conflicts with SCHH/context, omit it. If relevant, say: "SCHH guidance overrides general guidance."
-    4) Cite ONLY SCHH/context items using bracketed numbers [1], [2] that map to the provided context sections.
-    5) Do NOT include a separate 'Sources' or 'References' section; the app will render sources from metadata.
-    6) If the SCHH/context lacks key info, say what's missing, then add targeted (General) items.
-    7) Do NOT invent local names, phone numbers, or rules; include those only if present in SCHH/context.
-    8) Structure: SCHH-specific guidance (with citations) first, then "(General) additions)" (no citations).
-    """
-
-    tone_rules = f"# Tone\nWrite with a {TONE} tone. {VOICE_RULES}"
-    style_rules = f"# Formatting\n{STYLE_RULES}"
-
-    gap_hint = f"\nFocus (General) additions on these unmet needs: {', '.join(gaps)}\n" if gaps else ""
-    preface = (
-        "No relevant SCHH/context was found. If you answer, explicitly note you're using general knowledge only."
-        if not context_md else
-        "Use the SCHH/context where available. Add (General) items only for gaps."
-)
-
-    # 4) Build the *current* user message with RAG context
-    user_msg_current = (
-        f"{tone_rules}\n{style_rules}\n"
-        f"{answering_rules}\n"
-        f"{gap_hint}"
-        f"# User query\n{prompt}\n\n"
-        f"# SCHH/Context Sections\n{context_md}\n"
-        f"# Output format\n"
-        f"- Start with 1–2 lines short summary (don't use a shot summary title)\n"
-        f"- Then **Key points** (bullets)\n"
-        f"- Add **Steps** if procedural\n"
-        f"- Use inline citations like [1], [2] where relevant\n"
-        f"- Do **not** include a 'Sources' section (the app shows sources separately)\n"
-    )
-
-    # 5) Build messages with *prior* history for this sessionid
-    messages = build_messages_with_history(sessionid, SYSTEM_PROMPT, user_msg_current)
-
-    # 6) Append the raw user prompt (not the big injected one) to history
-    append_msg(sessionid, "user", prompt)
-
-    if stream:
-        async def gen():
-            # initial heartbeat
-            # yield sse({"type": "content", "delta": ""})
-            final_text_parts = []
-            async for chunk in llm.astream(messages):
-                text = getattr(chunk, "content", None)
-                if isinstance(text, list):
-                    text = "".join([seg.get("text","") for seg in text if isinstance(seg, dict)])
-                if text:
-                    final_text_parts.append(text)
-                    yield sse({"type": "content", "delta": text})
-            final_text = "".join(final_text_parts)
-            # store assistant reply to session history
-            append_msg(sessionid, "assistant", final_text)
-            yield sse({"type": "final", "sources": sources})
-        headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
-        return StreamingResponse(gen(), headers=headers)
-
-    # non-stream
-    resp = llm.invoke(messages)
-    answer = getattr(resp, "content", "")
-    append_msg(sessionid, "assistant", answer)
-    return JSONResponse({"answer": answer, "sources": sources, "model": model, "index": index, "namespace": namespace})
-
-# Optional GET route kept for compatibility
-@app.get("/chat/{prompt}")
-async def chat_get(prompt: str, request: Request,
-                   sessionid: Optional[str] = None,
-                   model: Optional[str] = None,
-                   index: Optional[str] = None,
-                   namespace: Optional[str] = None,
-                   stream: Optional[bool] = False):
-    model = model or DEFAULT_MODEL
-    index = index or DEFAULT_INDEX
-    namespace = namespace or DEFAULT_NAMESPACE
-    agent = get_agent(model, index, namespace)
-    config = {"configurable": {"thread_id": sessionid or secrets.token_hex(4)}}
-    messages = build_messages(prompt)
-    if stream:
-        headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
-        return StreamingResponse(stream_response(agent, messages, config), headers=headers)
-    else:
-        return non_stream_response(agent, messages, config, model, index, namespace)
-
+# Debug endpoints
 @app.get("/debug_search")
 def debug_search(q: str, index: Optional[str] = None, namespace: Optional[str] = None, k: int = 5):
     idx_name = index or DEFAULT_INDEX
@@ -819,7 +834,6 @@ def diag(index: Optional[str] = None, namespace: Optional[str] = None):
     ns = namespace or DEFAULT_NAMESPACE
     try:
         stats = pc.Index(idx_name).describe_index_stats()
-        # Cherry-pick only JSON-safe parts
         out = {
             "dimension": stats.get("dimension"),
             "namespaces": stats.get("namespaces", {}),
@@ -828,7 +842,130 @@ def diag(index: Optional[str] = None, namespace: Optional[str] = None):
         return JSONResponse({"index": idx_name, "namespace": ns, "stats": out})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-    
+
+# -----------------------------------------------------------------------------
+# Chat endpoints
+# -----------------------------------------------------------------------------
+def build_user_msg_with_context(prompt: str, context_md: str, gaps: List[str]) -> str:
+    answering_rules = """
+# Answering Rules (Blend Mode)
+1) The SCHH/context is the source of truth for local rules, procedures, contacts, and exceptions.
+2) You MAY add general best-practice/background items only to fill gaps. Prefix each such line with "(General)".
+3) If general guidance conflicts with SCHH/context, omit it. If relevant, say: "SCHH guidance overrides general guidance."
+4) Cite ONLY SCHH/context items using bracketed numbers [1], [2] that map to the provided context sections.
+5) Do NOT include a separate 'Sources' section; the app will render sources from metadata.
+6) If the SCHH/context lacks key info, say what's missing, then add targeted (General) items.
+7) Do NOT invent local names, phone numbers, or rules; include those only if present in SCHH/context.
+8) Structure: SCHH-specific guidance (with citations) first, then "(General) additions)" (no citations).
+9) Tools available: current_date, schh_weather, rewrite_query. Do NOT perform retrieval; the SCHH/Context is authoritative for this answer.
+"""
+    tone_rules = f"# Tone\nWrite with a {TONE} tone. {VOICE_RULES}"
+    style_rules = f"# Formatting\n{STYLE_RULES}"
+    gap_hint = f"\nFocus (General) additions on these unmet needs: {', '.join(gaps)}\n" if gaps else ""
+    return (
+        f"{tone_rules}\n{style_rules}\n{answering_rules}\n{gap_hint}"
+        f"# User query\n{prompt}\n\n"
+        f"# SCHH/Context Sections\n{context_md}\n"
+        f"# Output format\n"
+        f"- Start with 1–2 lines short summary (don't use a shot summary title)\n"
+        f"- Then **Key points** (bullets)\n"
+        f"- Add **Steps** if procedural\n"
+        f"- Use inline citations like [1], [2] where relevant\n"
+        f"- Do **not** include a 'Sources' section (the app shows sources separately)\n"
+    )
+
+def extract_gaps_for_general(prompt: str, context_md: str, llm, max_chars: int = 2500) -> list[str]:
+    gap_prompt = (
+        "List 3–6 short items the answer would need that are NOT present in the provided context. "
+        "Return a JSON array of short noun-phrases or questions. Do not repeat items covered by the context.\n\n"
+        f"User query:\n{prompt}\n\nContext (truncated):\n{context_md[:max_chars]}"
+    )
+    try:
+        resp = llm.invoke([{"role":"user","content":gap_prompt}])
+        items = json.loads(getattr(resp, "content", "[]"))
+        if isinstance(items, list):
+            return [str(x)[:120] for x in items][:6]
+    except Exception:
+        pass
+    return []
+
+@app.post("/chat")
+@app.post("/chat/")
+async def chat_post(request: Request):
+    payload   = await request.json()
+    prompt    = payload.get("prompt", "")
+    model     = payload.get("model", DEFAULT_MODEL)
+    index     = payload.get("index", DEFAULT_INDEX)
+    namespace = payload.get("namespace", DEFAULT_NAMESPACE)
+    stream    = bool(payload.get("stream", False))
+    sessionid = payload.get("sessionid", secrets.token_hex(4))
+    mt        = int(payload.get("max_tokens", MAX_OUTPUT_TOKENS))
+    mt        = max(256, min(mt, 4000))
+
+    # Retrieval (authoritative)
+    ctx = retrieve_context(prompt, index, namespace)
+    context_md, sources = ctx["context_md"], ctx["sources"]
+
+    # Gap extraction (small cap ok)
+    llm_for_gaps = make_llm(model, max_tokens=512)
+    gaps = extract_gaps_for_general(prompt, context_md, llm_for_gaps) if (context_md and USE_GAP_EXTRACTOR) else []
+
+    user_msg_current = build_user_msg_with_context(prompt, context_md, gaps)
+
+    messages = build_messages_with_history(sessionid, SYSTEM_PROMPT, user_msg_current)
+    append_msg(sessionid, "user", prompt)
+
+    # Agent WITHOUT retrieve (POST uses server-side context)
+    agent = get_agent(model, index, namespace, include_retrieve=False, max_tokens=mt)
+    config = {"configurable": {"thread_id": sessionid}}
+
+    if stream:
+        headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        return StreamingResponse(
+            stream_response(agent, messages, config, base_sources=sources, sessionid=sessionid, model=model),
+            headers=headers
+        )
+
+    # non-stream path
+    return non_stream_response(agent, messages, config, model, index, namespace, base_sources=sources)
+
+# GET route (agent WITH retrieve tool)
+@app.get("/chat/{prompt}")
+async def chat_get(prompt: str, request: Request,
+                   sessionid: Optional[str] = None,
+                   model: Optional[str] = None,
+                   index: Optional[str] = None,
+                   namespace: Optional[str] = None,
+                   stream: Optional[bool] = False,
+                   max_tokens: Optional[int] = None):
+    model = model or DEFAULT_MODEL
+    index = index or DEFAULT_INDEX
+    namespace = namespace or DEFAULT_NAMESPACE
+    mt = max_tokens or MAX_OUTPUT_TOKENS
+
+    agent = get_agent(model, index, namespace, include_retrieve=True, max_tokens=mt)
+    config = {"configurable": {"thread_id": sessionid or secrets.token_hex(4)}}
+    messages = build_messages(prompt)
+
+    if stream:
+        headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        return StreamingResponse(
+            stream_response(agent, messages, config, base_sources=[], sessionid=sessionid or None, model=model),
+            headers=headers
+        )
+    else:
+        return non_stream_response(agent, messages, config, model, index, namespace, base_sources=[])
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -838,4 +975,5 @@ if __name__ == "__main__":
     except Exception:
         pass
     import uvicorn
-    uvicorn.run('serve:app', host="0.0.0.0", port=8080, reload=True)
+    # In production, prefer running via process manager and avoid reload to prevent stream cuts.
+    uvicorn.run('serve:app', host="0.0.0.0", port=8080, reload=False)
