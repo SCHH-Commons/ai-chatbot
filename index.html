@@ -92,6 +92,7 @@
     table td { border: 1px solid #e8e8e8;}
     @media screen and (max-width: 800px) { table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; -ms-overflow-style: -ms-autohiding-scrollbar; } }
 
+    .citation { display: inline-flex; align-items: center; justify-content: center; margin-left: .5em; border: 1px solid #ccc; background-color: #ddd; height: 1.8em; width: 1.8em; border-radius: 50%; font-size: 0.7em; font-weight: bold; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -155,6 +156,7 @@
   <script type="module">
 
     // import any needed Shoelace components (https://shoelace.style/)
+    import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/badge/badge.js';
     import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/button/button.js';
     import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/copy-button/copy-button.js';
     import 'https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/components/drawer/drawer.js';
@@ -376,12 +378,16 @@
     }
 
     function addSources(container, sources){
+      console.log(sources)
+      let innerHTML = container.querySelector('.content')?.innerHTML || '';
+      let content = container.querySelector('.content');
+      // if (content) content.innerHTML = content.innerHTML.replace(/\[(\d+)\]/g, `<sl-tooltip content="$1"> <div slot="content">I'm not <strong>just</strong> a tooltip, I'm a <em>tooltip</em> with HTML!</div> <div class="citation">$1</div> </sl-tooltip>`);
       if (!sources || !sources.length) return;
       const s = document.createElement('div'); s.className = 'sources';
       s.innerHTML = `<div class="meta">Sources</div>` + sources.map((src,i)=>{
         const label = escapeHtml(src.title || src.doc_id || `Source ${i+1}`);
         const href = src.uri || '#';
-        return `<div>[${i+1}] <a href="${href}" target="_blank" rel="noopener">${label}</a></div>`;
+        return `<div>[${i+1}] <a href="${href}" target="_blank" rel="noopener">${label}</a>: ${src.sections[0].title}</div>`;
       }).join('');
       container.appendChild(s);
     }

@@ -65,11 +65,11 @@ HYBRID_ALPHA       = float(os.getenv("HYBRID_ALPHA", "0.5"))
 BM25_ENCODER_PATH  = os.getenv("BM25_ENCODER_PATH", "./bm25_encoder_schh.joblib")
 SPEED_MODE         = os.getenv("SPEED_MODE", "0") == "1"
 RETR_TOP_K         = int(os.getenv("RETR_TOP_K", "30" if SPEED_MODE else "50"))
-DOCS_MAX           = int(os.getenv("DOCS_MAX", "4"  if SPEED_MODE else "6"))
+DOCS_MAX           = int(os.getenv("DOCS_MAX", "6"  if SPEED_MODE else "10"))
 CHUNKS_PER_DOC     = int(os.getenv("CHUNKS_PER_DOC", "2" if SPEED_MODE else "3"))
 MERGED_MAX_CHARS   = int(os.getenv("MERGED_MAX_CHARS", "2500" if SPEED_MODE else "3500"))
 USE_GAP_EXTRACTOR  = os.getenv("USE_GAP_EXTRACTOR", "0") == "1"  # default OFF now
-SIBS_MAX           = int(os.getenv("SIBS_MAX", "2"))
+SIBS_MAX           = int(os.getenv("SIBS_MAX", "4"))
 MAX_EXTRAS         = int(os.getenv("MAX_EXTRAS", "300"))
 
 # GET-path rerank tuning
@@ -326,7 +326,8 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
         namespace=namespace,
     )
     matches = resp.get("matches", []) if isinstance(resp, dict) else getattr(resp, "matches", [])
-
+    log.info(f"[retrieve_context] pinecone query returned {len(matches)} matches")
+    
     docs = []
     for m in matches or []:
         mid = m.get("id") if isinstance(m, dict) else getattr(m, "id", "")
@@ -335,6 +336,12 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
         d = type("Doc", (), {})()
         d.id, d.metadata, d.page_content = mid, md, txt
         docs.append(d)
+
+    '''
+    for i, doc in enumerate(docs):
+        doc.metadata['seq'] = i + 1
+        log.info(json.dumps(doc.metadata, indent=2))
+    '''
 
     by_doc: Dict[str, List] = {}
     for d in docs:
@@ -380,6 +387,7 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
             d0.page_content = merged
             merged_docs.append(d0)
 
+    log.info(f"[retrieve_context] retrieved {len(merged_docs)} merged docs from {len(by_doc)} source docs")
     if not merged_docs:
         return {"context_md": "", "sources": []}
 
@@ -396,19 +404,57 @@ def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> D
         if len(selected) >= DOCS_MAX:
             break
     top = selected or merged_docs[:DOCS_MAX]
+    
+    log.info(f"[retrieve_context] selected {len(top)} top docs after MMR-lite")
+    #for d in top:
+    #    log.info(json.dumps(getattr(d, "metadata", {}) or {}, indent=2))
 
     # Build Markdown context + sources
     ctx_parts, sources = [], []
+    by_doc_sections: Dict[str, List[Dict[str, str]]] = {}
+
     for i, d in enumerate(top, 1):
         meta  = getattr(d, "metadata", {}) or {}
         raw_title = (meta.get("title") or d.id or "")
         cleaned   = raw_title.split("-")[-1].replace(".md","").replace("_"," ")
-        title     = (cleaned.strip() or raw_title)
-        uri   = meta.get("source")
+        doc_title = (cleaned.strip() or raw_title)
+        uri       = meta.get("source")
+
+        # --- section fields (if available from your indexer) ---
+        header_path = meta.get("header_path") or meta.get("hpath") or []
+        section_title = " › ".join(header_path[-2:]) if isinstance(header_path, list) and header_path else meta.get("section")
+        anchor = meta.get("anchor") or meta.get("section_id") or None
+        chunk_id = meta.get("chunk_id") or (d.id or "").split(":", 1)[-1] or None
+
+        # context block (unchanged)
         ctx_parts.append(f"### [{i}] {getattr(d, 'page_content', '')}")
+
+        # aggregate sections per base doc
         base = (d.id or "").rsplit(":", 1)[0]
-        if not any(s.get("doc_id")==base for s in sources):
-            sources.append({"doc_id": base, "title": title, "uri": uri})
+        by_doc_sections.setdefault(base, [])
+        by_doc_sections[base].append({
+            "title": section_title or "(section)",
+            "anchor": anchor,
+            "chunk": chunk_id,
+        })
+
+        # ensure one source entry per base doc, we'll attach sections later
+        if not any(s.get("doc_id") == base for s in sources):
+            sources.append({"doc_id": base, "title": doc_title, "uri": uri})
+
+    # attach sections (dedup by (title,anchor,chunk))
+    for s in sources:
+        doc_id = s["doc_id"]
+        sects = by_doc_sections.get(doc_id, [])
+        seen = set()
+        dedup = []
+        for sec in sects:
+            key = (sec.get("title"), sec.get("anchor"), sec.get("chunk"))
+            if key in seen: continue
+            seen.add(key)
+            dedup.append(sec)
+        s["sections"] = dedup[:5]  # cap to keep UI tidy
+
     context_md = "\n\n".join(ctx_parts)
     return {"context_md": context_md, "sources": sources}
 
@@ -539,8 +585,18 @@ def build_agent(model: str, index_name: str, namespace: Optional[str],
                     return docs[:top_k]
 
             ranked = _llm_rerank(query, merged_docs, top_k=RERANK_TOP_K)
+            def _mk_meta(d):
+                md = dict(getattr(d, "metadata", {}) or {})
+                # derive section fields if missing
+                hp = md.get("header_path") or md.get("hpath") or []
+                if not md.get("section") and isinstance(hp, list) and hp:
+                    md["section"] = " › ".join(hp[-2:])
+                if not md.get("chunk_id"):
+                    md["chunk_id"] = (getattr(d, "id", "") or "").split(":", 1)[-1]
+                return md
+
             serialized = "\n||\n".join(
-                f"Source: {json.dumps(getattr(d, 'metadata', {}) or {})}\n"
+                f"Source: {json.dumps(_mk_meta(d))}\n"
                 f"Content: {getattr(d, 'page_content', '')}"
                 for d in ranked
             )
@@ -623,7 +679,7 @@ async def stream_response(agent,
     saw_chat_stream = False  # prefer chat stream; ignore llm stream if this is True
 
     # heartbeat
-    yield sse({"type": "content", "delta": ""})
+    # yield sse({"type": "content", "delta": ""})
 
     try:
         async for ev in agent.astream_events({"messages": messages}, config):
@@ -703,14 +759,31 @@ async def stream_response(agent,
                     meta_strs = [re.sub(r"^Source:\s*", "", d.split("\n")[0]) for d in docs if d.strip()]
                     for m in meta_strs:
                         rec = json.loads(m)
-                        src_id = (rec.get("id") or "").rsplit(":", 1)[0]
-                        if src_id and not any(s.get("doc_id") == src_id for s in sources):
-                            sources.append({
-                                "doc_id": src_id,
-                                "title": rec.get("title") or src_id,
-                                "uri":   rec.get("source"),
-                                "chunk": rec.get("chunk_id")
-                            })
+                        src = {k: v for k, v in rec.items()
+                            if k in ("id", "title", "source", "chunk_id", "header_path", "section", "anchor")}
+                        # …
+                        if "id" in src:
+                            src_id = (src["id"] or "").rsplit(":", 1)[0]
+                            # build/merge per-doc entry with sections
+                            section_entry = {
+                                "title": src.get("section") or (" › ".join(src.get("header_path", [])[-2:]) if src.get("header_path") else None),
+                                "anchor": src.get("anchor"),
+                                "chunk": src.get("chunk_id"),
+                            }
+                            # upsert doc card
+                            card = next((s for s in sources if s.get("doc_id") == src_id), None)
+                            if not card:
+                                card = {"doc_id": src_id,
+                                        "title": src.get("title") or src_id,
+                                        "uri":   src.get("source"),
+                                        "sections": []}
+                                sources.append(card)
+                            if section_entry["title"] or section_entry["anchor"] or section_entry["chunk"]:
+                                if section_entry not in card["sections"]:
+                                    card["sections"].append(section_entry)
+                            # optional: cap per-doc sections
+                            if len(card["sections"]) > 5:
+                                card["sections"] = card["sections"][:5]
                 except Exception:
                     pass
     except Exception as e:
@@ -785,14 +858,31 @@ def non_stream_response(agent, messages, config, model: str, index: str, namespa
             for ms in meta_strs:
                 try:
                     rec = json.loads(ms)
-                    src_id = (rec.get("id") or "").rsplit(":", 1)[0]
-                    if src_id and not any(s.get("doc_id") == src_id for s in sources):
-                        sources.append({
-                            "doc_id": src_id,
-                            "title": rec.get("title") or src_id,
-                            "uri":   rec.get("source"),
-                            "chunk": rec.get("chunk_id")
-                        })
+                    src = {k: v for k, v in rec.items()
+                        if k in ("id", "title", "source", "chunk_id", "header_path", "section", "anchor")}
+                    # …
+                    if "id" in src:
+                        src_id = (src["id"] or "").rsplit(":", 1)[0]
+                        # build/merge per-doc entry with sections
+                        section_entry = {
+                            "title": src.get("section") or (" › ".join(src.get("header_path", [])[-2:]) if src.get("header_path") else None),
+                            "anchor": src.get("anchor"),
+                            "chunk": src.get("chunk_id"),
+                        }
+                        # upsert doc card
+                        card = next((s for s in sources if s.get("doc_id") == src_id), None)
+                        if not card:
+                            card = {"doc_id": src_id,
+                                    "title": src.get("title") or src_id,
+                                    "uri":   src.get("source"),
+                                    "sections": []}
+                            sources.append(card)
+                        if section_entry["title"] or section_entry["anchor"] or section_entry["chunk"]:
+                            if section_entry not in card["sections"]:
+                                card["sections"].append(section_entry)
+                        # optional: cap per-doc sections
+                        if len(card["sections"]) > 5:
+                            card["sections"] = card["sections"][:5]
                 except Exception:
                     continue
     except Exception:
@@ -1007,4 +1097,4 @@ if __name__ == "__main__":
     except Exception:
         pass
     import uvicorn
-    uvicorn.run('serve:app', host="0.0.0.0", port=8080, reload=False)
+    uvicorn.run('serve:app', host="0.0.0.0", port=8080, reload=True)
