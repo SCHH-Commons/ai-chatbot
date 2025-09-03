@@ -7,9 +7,10 @@ Agentic Chat Server (SCHH) — Markdown + SSE + heartbeat + hybrid retrieval + n
 - Markdown-oriented system prompt & formatting rules
 - SSE streaming with heartbeat, robust token event handling, guaranteed tail
 - Session memory via LangGraph MemorySaver (thread_id=sessionid)
-- Query rewrite, sentence-aware compression, strict LLM rerank
+- Query rewrite, sentence-aware compression, strict LLM rerank (GET path)
 - OpenAI minis: force temperature=1.0; Anthropic uses FORCED_TEMP
 - Configurable output caps and timeouts
+- SCHH-only mode: no (General) additions, no “missing info” section
 """
 
 import os, re, json, time, secrets, functools, logging, math, asyncio
@@ -62,14 +63,19 @@ REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT", "120"))  # seconds
 # Retrieval knobs
 HYBRID_ALPHA       = float(os.getenv("HYBRID_ALPHA", "0.5"))
 BM25_ENCODER_PATH  = os.getenv("BM25_ENCODER_PATH", "./bm25_encoder_schh.joblib")
-SPEED_MODE         = os.getenv("SPEED_MODE", "1") == "1"
+SPEED_MODE         = os.getenv("SPEED_MODE", "0") == "1"
 RETR_TOP_K         = int(os.getenv("RETR_TOP_K", "30" if SPEED_MODE else "50"))
 DOCS_MAX           = int(os.getenv("DOCS_MAX", "4"  if SPEED_MODE else "6"))
 CHUNKS_PER_DOC     = int(os.getenv("CHUNKS_PER_DOC", "2" if SPEED_MODE else "3"))
 MERGED_MAX_CHARS   = int(os.getenv("MERGED_MAX_CHARS", "2500" if SPEED_MODE else "3500"))
-USE_GAP_EXTRACTOR  = os.getenv("USE_GAP_EXTRACTOR", "0" if SPEED_MODE else "1") == "1"
+USE_GAP_EXTRACTOR  = os.getenv("USE_GAP_EXTRACTOR", "0") == "1"  # default OFF now
 SIBS_MAX           = int(os.getenv("SIBS_MAX", "2"))
 MAX_EXTRAS         = int(os.getenv("MAX_EXTRAS", "300"))
+
+# GET-path rerank tuning
+RERANK_MAX_PASSAGES   = int(os.getenv("RERANK_MAX_PASSAGES", "15"))   # was 30
+RERANK_SNIPPET_CHARS  = int(os.getenv("RERANK_SNIPPET_CHARS", "400")) # was 800
+RERANK_TOP_K          = int(os.getenv("RERANK_TOP_K", "5"))           # was 6
 
 SYSTEM_PROMPT = (
     "You are the SCHH community assistant.\n"
@@ -96,6 +102,10 @@ STYLE_RULES = os.getenv("STYLE_RULES", (
     "- Keep line length reasonable; add blank lines between sections.\n"
 ))
 
+# SCHH-only mode (no General, no Missing)
+ALLOW_GENERAL = os.getenv("ALLOW_GENERAL", "0") == "1"  # OFF
+SHOW_MISSING  = os.getenv("SHOW_MISSING",  "0") == "1"  # OFF
+
 # Globals
 embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
 pc = Pinecone()
@@ -119,6 +129,14 @@ def append_msg(sessionid: str, role: str, content: str) -> None:
 # -----------------------------------------------------------------------------
 # Utils
 # -----------------------------------------------------------------------------
+def _lcp_len(a: str, b: str) -> int:
+    """length of longest common prefix"""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
 def sse(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -271,7 +289,7 @@ def make_llm(model: str, max_tokens: Optional[int] = None):
         log.info(f"[make_llm] OpenAI model={model} -> temperature=1.0, streaming=True, max_tokens={mt}")
         return ChatOpenAI(
             model=model,
-            temperature=1.0,
+            temperature=1.0,          # avoid 400s on minis
             streaming=True,
             max_tokens=mt,
             timeout=REQUEST_TIMEOUT,
@@ -290,7 +308,7 @@ def make_llm(model: str, max_tokens: Optional[int] = None):
     )
 
 # -----------------------------------------------------------------------------
-# Retrieval pipeline (server-side authoritative)
+# Retrieval pipeline (server-side authoritative; POST path)
 # -----------------------------------------------------------------------------
 def retrieve_context(query: str, index_name: str, namespace: Optional[str]) -> Dict[str, Any]:
     log.info(f"[retrieve_context] q={query!r} index={index_name} ns={namespace}")
@@ -439,7 +457,7 @@ def build_agent(model: str, index_name: str, namespace: Optional[str],
     if include_retrieve:
         @tool(response_format="content_and_artifact")
         def retrieve(query: str):
-            """Hybrid Pinecone retrieval (agent tool variant)."""
+            """Hybrid Pinecone retrieval (agent tool variant) with trimmed rerank prompt."""
             dense_q = embeddings.embed_query(query)
             bm25 = get_bm25()
             sparse_q = bm25.encode_queries([query])[0] if bm25 else None
@@ -501,15 +519,16 @@ def build_agent(model: str, index_name: str, namespace: Optional[str],
             if not merged_docs:
                 return "", []
 
-            def _llm_rerank(q: str, docs: List, top_k: int = 6) -> List:
+            def _llm_rerank(q: str, docs: List, top_k: int = RERANK_TOP_K) -> List:
                 try:
                     items = []
-                    for i, d in enumerate(docs[:30]):
+                    for i, d in enumerate(docs[:RERANK_MAX_PASSAGES]):
                         title = (getattr(d, "metadata", {}) or {}).get("title") or (d.id or "")[:80]
-                        snippet = (getattr(d, "page_content", "") or "")[:800]
+                        snippet = (getattr(d, "page_content", "") or "")[:RERANK_SNIPPET_CHARS]
                         items.append(f"[{i}] {title}\n{snippet}")
                     prompt = (
-                        "Rank these passages by relevance to the query. Return a JSON array of indices only.\n\n"
+                        "Rank these passages by relevance to the query. "
+                        "Return a JSON array of indices only (e.g., [2,0,1]).\n\n"
                         f"Query: {q}\n\nPassages:\n" + "\n\n".join(items) + "\n\nIndices:"
                     )
                     resp = llm.invoke(prompt)
@@ -517,9 +536,9 @@ def build_agent(model: str, index_name: str, namespace: Optional[str],
                     ranked = [docs[i] for i in idx if isinstance(i, int) and 0 <= i < len(docs)]
                     return ranked[:top_k] if ranked else docs[:top_k]
                 except Exception:
-                    return docs[:6]
+                    return docs[:top_k]
 
-            ranked = _llm_rerank(query, merged_docs, top_k=6)
+            ranked = _llm_rerank(query, merged_docs, top_k=RERANK_TOP_K)
             serialized = "\n||\n".join(
                 f"Source: {json.dumps(getattr(d, 'metadata', {}) or {})}\n"
                 f"Content: {getattr(d, 'page_content', '')}"
@@ -559,6 +578,37 @@ def build_messages_with_history(sessionid: str, system_prompt: str, current_user
     return msgs
 
 # -----------------------------------------------------------------------------
+# Build the current user message with SCHH-only rules
+# -----------------------------------------------------------------------------
+def build_user_msg_with_context(prompt: str, context_md: str, gaps: List[str]) -> str:
+    tone_rules  = f"# Tone\nWrite with a {TONE} tone. {VOICE_RULES}"
+    style_rules = f"# Formatting\n{STYLE_RULES}"
+
+    # Strict SCHH-only mode (requested)
+    answering_rules = """
+# Answering Rules (SCHH-only)
+1) Use only SCHH/context for local rules, procedures, contacts, and exceptions.
+2) Do NOT add any general best-practice/background items.
+3) Do NOT include a 'what SCHH context does not specify' section.
+4) If key info is missing, briefly say so in one sentence without adding general advice.
+5) Cite ONLY SCHH/context items using bracketed numbers [1], [2] that map to the provided context sections.
+6) Do NOT include a separate 'Sources' section; the app will render sources from metadata.
+"""
+
+    return (
+        f"{tone_rules}\n{style_rules}\n{answering_rules}\n"
+        f"# User query\n{prompt}\n\n"
+        f"# SCHH/Context Sections\n{context_md}\n"
+        f"# Output format\n"
++       f"- Start with a 1–2 sentence summary with no heading/label. Do NOT write 'Summary', 'TL;DR', or a heading.\n"
+        f"- Then **Key points** (bullets)\n"
+        f"- Add **Steps** if procedural\n"
+        f"- Use inline citations like [1], [2] where relevant\n"
+        f"- Avoid repeating the same sentence/section more than once; don’t restate earlier bullets verbatim.\n"
+
+    )
+
+# -----------------------------------------------------------------------------
 # Streaming (event-level + fallbacks, guaranteed tail)
 # -----------------------------------------------------------------------------
 async def stream_response(agent,
@@ -570,11 +620,11 @@ async def stream_response(agent,
     sources: List[Dict[str, Any]] = list(base_sources or [])
     final_text_parts: List[str] = []
     yielded_any = False
+    saw_chat_stream = False  # prefer chat stream; ignore llm stream if this is True
 
     # heartbeat
     yield sse({"type": "content", "delta": ""})
 
-    # Primary: event-level streaming
     try:
         async for ev in agent.astream_events({"messages": messages}, config):
             et = ev.get("event"); data = ev.get("data") or {}
@@ -585,11 +635,15 @@ async def stream_response(agent,
                 if isinstance(delta, list):
                     delta = "".join(seg.get("text", "") for seg in delta if isinstance(seg, dict))
                 if delta:
+                    saw_chat_stream = True
                     yielded_any = True
                     final_text_parts.append(delta)
                     yield sse({"type": "content", "delta": delta})
 
             elif et == "on_llm_stream":
+                # Some stacks emit this too; if we've already seen chat stream, skip to avoid duplicates
+                if saw_chat_stream:
+                    continue
                 chunk = data.get("chunk")
                 delta = getattr(chunk, "content", "") if hasattr(chunk, "content") else (chunk or "")
                 if isinstance(delta, list):
@@ -600,6 +654,7 @@ async def stream_response(agent,
                     yield sse({"type": "content", "delta": delta})
 
             elif et in ("on_chat_model_end", "on_chain_end"):
+                # Emit only the *remainder* not already streamed
                 text_candidates: List[str] = []
                 gens = data.get("generations")
                 if gens and isinstance(gens, list):
@@ -618,13 +673,30 @@ async def stream_response(agent,
                     for k in ("content", "output", "text"):
                         if out.get(k):
                             text_candidates.append(str(out[k]))
-                final_tail = "".join(tc for tc in text_candidates if tc)
-                if final_tail:
-                    yielded_any = True
-                    final_text_parts.append(final_tail)
-                    yield sse({"type": "content", "delta": final_tail})
+
+                tail = "".join(tc for tc in text_candidates if tc)
+                if tail:
+                    already = "".join(final_text_parts)
+                    if not already:
+                        # nothing streamed; emit full tail once
+                        yielded_any = True
+                        final_text_parts.append(tail)
+                        yield sse({"type": "content", "delta": tail})
+                    else:
+                        # emit remainder only if tail starts with what we've streamed
+                        if tail.startswith(already):
+                            rem = tail[len(already):]
+                        else:
+                            # fall back to LCP-based remainder
+                            l = _lcp_len(already, tail)
+                            rem = tail[l:]
+                        if rem:
+                            yielded_any = True
+                            final_text_parts.append(rem)
+                            yield sse({"type": "content", "delta": rem})
 
             elif et == "on_tool_end":
+                # collect sources only; do NOT emit tool output as content
                 output = data.get("output") or ""
                 try:
                     docs = str(output).split("\n||\n")
@@ -644,22 +716,7 @@ async def stream_response(agent,
     except Exception as e:
         yield sse({"type": "error", "message": str(e)})
 
-    # Fallback 1: message-level streaming
-    if not yielded_any:
-        try:
-            async for msg, meta in agent.astream({"messages": messages}, config, stream_mode="messages"):
-                if isinstance(msg, AIMessageChunk):
-                    delta = msg.content if isinstance(msg.content, str) else "".join(
-                        seg.get("text", "") for seg in (msg.content or []) if isinstance(seg, dict)
-                    )
-                    if delta:
-                        yielded_any = True
-                        final_text_parts.append(delta)
-                        yield sse({"type": "content", "delta": delta})
-        except Exception:
-            pass
-
-    # Fallback 2: raw LLM streaming (bypass agent)
+    # fallbacks unchanged; they only run if nothing was streamed
     if not yielded_any and model:
         try:
             raw_llm = make_llm(model, max_tokens=MAX_OUTPUT_TOKENS)
@@ -674,7 +731,6 @@ async def stream_response(agent,
         except Exception:
             pass
 
-    # Fallback 3: one-shot invoke
     if not yielded_any:
         try:
             res = agent.invoke({"messages": messages}, config)
@@ -685,7 +741,6 @@ async def stream_response(agent,
         except Exception as e:
             yield sse({"type": "error", "message": str(e)})
 
-    # persist
     if sessionid:
         try:
             append_msg(sessionid, "assistant", "".join(final_text_parts))
@@ -846,33 +901,9 @@ def diag(index: Optional[str] = None, namespace: Optional[str] = None):
 # -----------------------------------------------------------------------------
 # Chat endpoints
 # -----------------------------------------------------------------------------
-def build_user_msg_with_context(prompt: str, context_md: str, gaps: List[str]) -> str:
-    answering_rules = """
-# Answering Rules (Blend Mode)
-1) The SCHH/context is the source of truth for local rules, procedures, contacts, and exceptions.
-2) You MAY add general best-practice/background items only to fill gaps. Prefix each such line with "(General)".
-3) If general guidance conflicts with SCHH/context, omit it. If relevant, say: "SCHH guidance overrides general guidance."
-4) Cite ONLY SCHH/context items using bracketed numbers [1], [2] that map to the provided context sections.
-5) Do NOT include a separate 'Sources' section; the app will render sources from metadata.
-6) If the SCHH/context lacks key info, say what's missing, then add targeted (General) items.
-7) Do NOT invent local names, phone numbers, or rules; include those only if present in SCHH/context.
-8) Structure: SCHH-specific guidance (with citations) first, then "(General) additions)" (no citations).
-9) Tools available: current_date, schh_weather, rewrite_query. Do NOT perform retrieval; the SCHH/Context is authoritative for this answer.
-"""
-    tone_rules = f"# Tone\nWrite with a {TONE} tone. {VOICE_RULES}"
-    style_rules = f"# Formatting\n{STYLE_RULES}"
-    gap_hint = f"\nFocus (General) additions on these unmet needs: {', '.join(gaps)}\n" if gaps else ""
-    return (
-        f"{tone_rules}\n{style_rules}\n{answering_rules}\n{gap_hint}"
-        f"# User query\n{prompt}\n\n"
-        f"# SCHH/Context Sections\n{context_md}\n"
-        f"# Output format\n"
-        f"- Start with 1–2 lines short summary (don't use a shot summary title)\n"
-        f"- Then **Key points** (bullets)\n"
-        f"- Add **Steps** if procedural\n"
-        f"- Use inline citations like [1], [2] where relevant\n"
-        f"- Do **not** include a 'Sources' section (the app shows sources separately)\n"
-    )
+def build_user_msg_with_context_wrapper(prompt: str, context_md: str, gaps: List[str]) -> str:
+    # Wrapper kept separate in case you toggle env to re-enable features later
+    return build_user_msg_with_context(prompt, context_md, gaps)
 
 def extract_gaps_for_general(prompt: str, context_md: str, llm, max_chars: int = 2500) -> list[str]:
     gap_prompt = (
@@ -906,12 +937,13 @@ async def chat_post(request: Request):
     ctx = retrieve_context(prompt, index, namespace)
     context_md, sources = ctx["context_md"], ctx["sources"]
 
-    # Gap extraction (small cap ok)
-    llm_for_gaps = make_llm(model, max_tokens=512)
-    gaps = extract_gaps_for_general(prompt, context_md, llm_for_gaps) if (context_md and USE_GAP_EXTRACTOR) else []
+    # Gap extraction disabled by default
+    gaps: List[str] = []
+    if USE_GAP_EXTRACTOR and context_md:
+        llm_for_gaps = make_llm(model, max_tokens=512)
+        gaps = extract_gaps_for_general(prompt, context_md, llm_for_gaps)
 
-    user_msg_current = build_user_msg_with_context(prompt, context_md, gaps)
-
+    user_msg_current = build_user_msg_with_context_wrapper(prompt, context_md, gaps)
     messages = build_messages_with_history(sessionid, SYSTEM_PROMPT, user_msg_current)
     append_msg(sessionid, "user", prompt)
 
@@ -975,5 +1007,4 @@ if __name__ == "__main__":
     except Exception:
         pass
     import uvicorn
-    # In production, prefer running via process manager and avoid reload to prevent stream cuts.
     uvicorn.run('serve:app', host="0.0.0.0", port=8080, reload=False)

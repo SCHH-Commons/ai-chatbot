@@ -439,7 +439,6 @@
         const isSSE = /text\/event-stream/i.test(res.headers.get('Content-Type')||'');
 
         const handle = (obj)=>{
-          console.log(obj)
           if (obj.type === 'content') {
             assistantMsg += obj.delta || '';
             contentEl.innerHTML = renderMD(assistantMsg);
